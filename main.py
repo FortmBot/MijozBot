@@ -2,10 +2,9 @@ import asyncio
 import logging
 import os
 import re
-import shutil
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
@@ -17,7 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery
+    ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BufferedInputFile
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram import BaseMiddleware
@@ -28,17 +27,18 @@ from aiogram import BaseMiddleware
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "8595238605"))
 DEVELOPER_ID = int(os.getenv("DEVELOPER_ID", "7041471070"))
-DB_PATH = Path(os.getenv("DB_PATH", "data/bot.sqlite3"))
-BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "data/backups"))
-BACKUP_INTERVAL_HOURS = int(os.getenv("BACKUP_INTERVAL_HOURS", "24"))
-BACKUP_SEND_TO_ADMINS = os.getenv("BACKUP_SEND_TO_ADMINS", "true").lower() == "true"
+BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip()
+BACKUP_INTERVAL_HOURS = max(1, int(os.getenv("BACKUP_INTERVAL_HOURS", "24")))
 BOT_PUBLIC_NAME = os.getenv("BOT_PUBLIC_NAME", "Kino bot")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN ENV kiritilmagan.")
 
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+if BACKUP_CHANNEL_ID:
+    try:
+        BACKUP_CHANNEL_ID = int(BACKUP_CHANNEL_ID)
+    except ValueError:
+        pass  # @username ko'rinishidagi kanal IDsi ham qabul qilinadi.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,11 +52,14 @@ dp = Dispatcher(storage=MemoryStorage())
 # =========================
 # DATABASE
 # =========================
+# Barcha ma'lumotlar faqat RAMdagi SQLite xotirasida turadi.
+# Faylga yozilmaydi: Render qayta ishga tushsa, JSON zaxiradan tiklanadi.
+_MEMORY_DB = sqlite3.connect(":memory:", check_same_thread=False)
+_MEMORY_DB.row_factory = sqlite3.Row
+_MEMORY_DB.execute("PRAGMA foreign_keys = ON")
+
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return _MEMORY_DB
 
 def init_db():
     with db() as con:
@@ -234,7 +237,8 @@ def admin_kb():
         [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats"),
          InlineKeyboardButton(text="📣 Kanallar", callback_data="adm_channels")],
         [InlineKeyboardButton(text="💳 VIP sozlamalari", callback_data="adm_vip_settings")],
-        [InlineKeyboardButton(text="📦 Zaxira yaratish", callback_data="adm_backup")]
+        [InlineKeyboardButton(text="📦 Zaxira olish", callback_data="adm_backup"),
+         InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="adm_restore")]
     ])
 
 # =========================
@@ -302,6 +306,9 @@ dp.callback_query.middleware(SubscriptionMiddleware())
 # =========================
 # FSM
 # =========================
+class ReceiptState(StatesGroup):
+    photo = State()
+
 class AddTitle(StatesGroup):
     title = State()
     kind = State()
@@ -535,9 +542,6 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
         "To‘lovni amalga oshirib, chek rasmini shu yerga yuboring."
     )
     await call.answer()
-
-class ReceiptState(StatesGroup):
-    photo = State()
 
 @dp.message(ReceiptState.photo, F.photo)
 async def receipt_received(message: Message, state: FSMContext):
@@ -972,60 +976,182 @@ async def bot_status(message: Message):
     await message.answer("🟢 Bot ishlayapti.")
 
 # =========================
-# BACKUPS
+# JSON BACKUP / RESTORE VIA TELEGRAM CHANNEL
 # =========================
-async def create_backup(send_to_admins=False):
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_TABLES = [
+    "users", "titles", "episodes", "mandatory_channels", "payments",
+    "settings", "audit_logs", "vip_history"
+]
+
+
+def build_backup_json() -> bytes:
+    """RAMdagi barcha jadvallarni bitta JSON faylga yig'adi."""
+    payload = {
+        "format": "kino_serial_bot_json_backup",
+        "version": 1,
+        "created_at": now_iso(),
+        "tables": {}
+    }
+    con = db()
+    for table in BACKUP_TABLES:
+        rows = con.execute(f"SELECT * FROM {table}").fetchall()
+        payload["tables"][table] = [dict(row) for row in rows]
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+async def create_backup():
+    if not BACKUP_CHANNEL_ID:
+        raise RuntimeError("BACKUP_CHANNEL_ID ENVga kanal IDsi yozilmagan.")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = BACKUP_DIR / f"backup_{stamp}.sqlite3"
-    # SQLite backup API safely snapshots a live database.
-    src = sqlite3.connect(DB_PATH)
-    dst = sqlite3.connect(target)
+    filename = f"kino_bot_backup_{stamp}.json"
+    data = build_backup_json()
+    document = BufferedInputFile(data, filename=filename)
+    sent = await bot.send_document(
+        chat_id=BACKUP_CHANNEL_ID,
+        document=document,
+        caption=f"📦 Kino bot JSON zaxirasi\n🕒 {stamp}\n📁 Barcha ma'lumotlar"
+    )
+    log.info("JSON backup Telegram kanaliga yuborildi: message_id=%s", sent.message_id)
+    return filename
+
+
+def restore_backup_json(raw: bytes):
+    """JSON fayldagi ma'lumotlarni RAM bazasiga to'liq qayta yuklaydi."""
     try:
-        src.backup(dst)
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except Exception as exc:
+        raise ValueError("JSON faylni o'qib bo'lmadi yoki fayl buzilgan.") from exc
+
+    if payload.get("format") != "kino_serial_bot_json_backup" or payload.get("version") != 1:
+        raise ValueError("Bu fayl ushbu botning mos JSON zaxirasi emas.")
+    tables = payload.get("tables")
+    if not isinstance(tables, dict):
+        raise ValueError("Zaxira faylida jadvallar topilmadi.")
+    for table in BACKUP_TABLES:
+        if table not in tables or not isinstance(tables[table], list):
+            raise ValueError(f"Zaxirada {table} ma'lumotlari yo'q.")
+
+    con = db()
+    con.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with con:
+            for table in reversed(BACKUP_TABLES):
+                con.execute(f"DELETE FROM {table}")
+            for table in BACKUP_TABLES:
+                rows = tables[table]
+                if not rows:
+                    continue
+                columns = [r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+                for row in rows:
+                    if not isinstance(row, dict) or any(k not in columns for k in row):
+                        raise ValueError(f"{table} jadvalidagi ma'lumotlar noto'g'ri.")
+                    keys = list(row.keys())
+                    placeholders = ",".join(["?"] * len(keys))
+                    col_sql = ",".join(keys)
+                    con.execute(
+                        f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
+                        [row[k] for k in keys]
+                    )
     finally:
-        dst.close()
-        src.close()
-    # Keep the latest 14 backups.
-    backups = sorted(BACKUP_DIR.glob("backup_*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in backups[14:]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
-    if send_to_admins and BACKUP_SEND_TO_ADMINS:
-        for admin_id in (OWNER_ID, DEVELOPER_ID):
-            try:
-                await bot.send_document(admin_id, target.open("rb"), caption=f"📦 Avtomatik zaxira: {stamp}")
-            except Exception as e:
-                log.warning("Backup yuborilmadi %s: %s", admin_id, e)
-    return target
+        con.execute("PRAGMA foreign_keys = ON")
+    return sum(len(tables[t]) for t in BACKUP_TABLES)
+
+
+class RestoreState(StatesGroup):
+    json_file = State()
+
 
 @dp.callback_query(F.data == "adm_backup")
 async def manual_backup(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    path = await create_backup(False)
-    await call.message.answer_document(path.open("rb"), caption="📦 Ma’lumotlar bazasi zaxirasi")
-    await call.answer("Zaxira yaratildi.")
+        return await call.answer("Ruxsat yo'q.", show_alert=True)
+    await call.answer("JSON zaxira tayyorlanmoqda...")
+    try:
+        filename = await create_backup()
+        await call.message.answer(f"✅ Zaxira kanalga yuborildi: <code>{filename}</code>")
+    except Exception as exc:
+        log.exception("Manual JSON backup failed")
+        await call.message.answer(f"❌ Zaxira yaratilmadi: {exc}")
+
+
+@dp.callback_query(F.data == "adm_restore")
+async def restore_begin(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Ruxsat yo'q.", show_alert=True)
+    await state.set_state(RestoreState.json_file)
+    await call.message.answer(
+        "♻️ <b>Zaxirani tiklash</b>\n\n"
+        "Backup kanalidan kerakli JSON faylni yuklab oling va shu chatga hujjat qilib yuboring.\n"
+        "Diqqat: tiklash hozirgi RAMdagi ma'lumotlarni zaxiradagi ma'lumotlar bilan almashtiradi."
+    )
+    await call.answer()
+
+
+@dp.message(Command("restore"))
+async def restore_command(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(RestoreState.json_file)
+    await message.answer(
+        "Backup kanalidan JSON zaxirani yuklab olib, shu yerga hujjat qilib yuboring.\n"
+        "Tiklash joriy ma'lumotlarni almashtiradi."
+    )
+
+
+@dp.message(RestoreState.json_file, F.document)
+async def restore_file_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".json"):
+        await message.answer("Faqat .json zaxira faylini yuboring.")
+        return
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await message.answer("Fayl juda katta. 20 MB dan kichik JSON yuboring.")
+        return
+    try:
+        stream = await bot.download(doc.file_id)
+        raw = stream.getvalue() if hasattr(stream, "getvalue") else stream.read()
+        count = restore_backup_json(raw)
+        await state.clear()
+        log_action(message.from_user.id, "JSON backup restored", f"{count} rows")
+        await message.answer(
+            f"✅ Zaxira tiklandi.\nJami tiklangan yozuvlar: <b>{count}</b>",
+            reply_markup=admin_kb()
+        )
+    except Exception as exc:
+        log.exception("JSON restore failed")
+        await message.answer(f"❌ Zaxirani tiklab bo'lmadi: {exc}")
+
+
+@dp.message(RestoreState.json_file)
+async def restore_file_expected(message: Message):
+    if is_admin(message.from_user.id):
+        await message.answer("Iltimos, JSON zaxira faylini hujjat (Document) sifatida yuboring.")
+
 
 @dp.message(Command("backup"))
 async def backup_command(message: Message):
     if not is_admin(message.from_user.id):
         return
-    path = await create_backup(False)
-    await message.answer_document(path.open("rb"), caption="📦 Ma’lumotlar bazasi zaxirasi")
+    try:
+        filename = await create_backup()
+        await message.answer(f"✅ JSON zaxira kanalga yuborildi: <code>{filename}</code>")
+    except Exception as exc:
+        log.exception("Backup command failed")
+        await message.answer(f"❌ Zaxira yaratilmadi: {exc}")
+
 
 async def backup_loop():
     while True:
         try:
-            await asyncio.sleep(max(1, BACKUP_INTERVAL_HOURS) * 3600)
-            path = await create_backup(BACKUP_SEND_TO_ADMINS)
-            log.info("Backup created: %s", path)
+            await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
+            await create_backup()
+            log.info("Avtomatik JSON zaxira kanalga yuborildi")
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Backup loop error")
+            log.exception("Automatic JSON backup failed")
 
 # =========================
 # ERROR HANDLING / MAIN
@@ -1037,11 +1163,7 @@ async def errors_handler(event):
 
 async def main():
     init_db()
-    # First backup on startup, then periodic backups.
-    try:
-        await create_backup(False)
-    except Exception:
-        log.exception("Initial backup failed")
+    # Ma'lumotlar RAMda turadi; davriy JSON zaxira kanalga yuboriladi.
     task = asyncio.create_task(backup_loop())
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
