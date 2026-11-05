@@ -5,6 +5,8 @@ import json
 import os
 import re
 import sys
+import threading
+import traceback
 from datetime import datetime, timedelta
 
 try:
@@ -15,7 +17,64 @@ except Exception:
 
 print("[1/6] main.py yuklandi, env tekshirilmoqda...", flush=True)
 
+
+def fail(msg):
+    print(f"XATO: {msg}", flush=True)
+    sys.exit(1)
+
+
+def _env_int(name, default=0):
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        fail(f"{name} faqat raqam bo'lishi kerak, lekin '{raw}' berildi. Masalan: -1001234567890")
+
+
+def _env_admin_ids():
+    raw = os.getenv("ADMIN_ID", "").strip()
+    if not raw:
+        fail("ADMIN_ID env kiritilmagan. Telegram ID ingizni yozing.")
+    ids = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.lstrip("-").isdigit():
+            fail(f"ADMIN_ID dagi '{part}' raqam emas. Masalan: 123456789")
+        ids.append(int(part))
+    if not ids:
+        fail("ADMIN_ID bo'sh. Telegram ID ingizni yozing.")
+    return ids
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    fail("BOT_TOKEN env kiritilmagan. BotFather dan olingan tokenni yozing.")
+ADMIN_IDS = _env_admin_ids()
+BACKUP_CHANNEL_ID = _env_int("BACKUP_CHANNEL_ID")
+PORT = _env_int("PORT", 10000)
+DATA_FILE = "data.json"
+print(f"[2/6] Env OK. Adminlar: {len(ADMIN_IDS)} ta, port: {PORT}", flush=True)
+
 from aiohttp import web
+
+
+def _health_page(request):
+    return web.Response(text="ok")
+
+
+def _run_health():
+    app = web.Application()
+    app.router.add_get("/", _health_page)
+    web.run_app(app, host="0.0.0.0", port=PORT, print=None)
+
+
+threading.Thread(target=_run_health, daemon=True).start()
+print(f"[3/6] Port {PORT} ochildi (health-server)", flush=True)
+
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart, Filter, StateFilter
@@ -25,46 +84,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BufferedInputFile, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup)
-
-print("[2/6] Kutubxonalar yuklandi.", flush=True)
-
-def _env_int(name, default=0):
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise SystemExit(
-            f"XATO: {name} faqat raqam bo'lishi kerak, lekin '{raw}' berildi. "
-            f"Masalan: -1001234567890"
-        )
-
-
-def _env_admin_ids():
-    raw = os.getenv("ADMIN_ID", "").strip()
-    if not raw:
-        raise SystemExit("XATO: ADMIN_ID env kiritilmagan. Telegram ID ingizni yozing.")
-    ids = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if not part.lstrip("-").isdigit():
-            raise SystemExit(f"XATO: ADMIN_ID dagi '{part}' raqam emas. Masalan: 123456789")
-        ids.append(int(part))
-    if not ids:
-        raise SystemExit("XATO: ADMIN_ID bo'sh. Telegram ID ingizni yozing.")
-    return ids
-
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise SystemExit("XATO: BOT_TOKEN env kiritilmagan. BotFather dan olingan tokenni yozing.")
-ADMIN_IDS = _env_admin_ids()
-BACKUP_CHANNEL_ID = _env_int("BACKUP_CHANNEL_ID")
-PORT = _env_int("PORT", 10000)
-DATA_FILE = "data.json"
 
 CATS = {
     "kino": "🎬 Kino",
@@ -471,7 +490,7 @@ bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
 dp.message.outer_middleware(GuardMiddleware())
 dp.callback_query.outer_middleware(GuardMiddleware())
-print(f"[3/6] Bot yaratildi. Adminlar: {len(ADMIN_IDS)} ta, zaxira kanal: {BACKUP_CHANNEL_ID}, port: {PORT}", flush=True)
+print(f"[3/6] Bot va routerlar tayyor. Zaxira kanal: {BACKUP_CHANNEL_ID}", flush=True)
 
 router_user = Router()
 router_admin = Router()
@@ -1405,26 +1424,14 @@ async def noop(cq: CallbackQuery):
 
 # ---------------- ishga tushirish ----------------
 
-async def health(request):
-    return web.Response(text="ok")
-
-
 async def main():
     print("[4/6] Local ma'lumot yuklanmoqda...", flush=True)
     db.load_local()
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"[5/6] Health-server ishga tushdi (port {PORT})", flush=True)
-
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except TelegramUnauthorizedError:
-        raise SystemExit("XATO: BOT_TOKEN noto'g'ri. BotFather dan yangi token olib qo'ying.")
-    print("[6/6] Telegram bilan bog'landik. Polling boshlanmoqda...", flush=True)
+        fail("BOT_TOKEN noto'g'ri. BotFather dan yangi token olib qo'ying.")
+    print("[5/6] Telegram bilan bog'landik. Polling boshlanmoqda...", flush=True)
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, "✅ Bot ishga tushdi.")
@@ -1438,5 +1445,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception as e:
-        raise SystemExit(f"Bot xato bilan to'xtadi: {type(e).__name__}: {e}")
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"Bot xato bilan to'xtadi:\n{tb}", flush=True)
+        sys.exit(1)
