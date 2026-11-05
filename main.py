@@ -1,1175 +1,1387 @@
 import asyncio
-import logging
+import csv
+import io
+import json
 import os
 import re
-import json
-import sqlite3
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiohttp import web
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BufferedInputFile
-)
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram import BaseMiddleware
+from aiogram.types import (BufferedInputFile, CallbackQuery,
+                           InlineKeyboardButton, InlineKeyboardMarkup,
+                           KeyboardButton, Message, ReplyKeyboardMarkup)
 
-# =========================
-# CONFIG
-# =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "8595238605"))
-DEVELOPER_ID = int(os.getenv("DEVELOPER_ID", "7041471070"))
-BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip()
-BACKUP_INTERVAL_HOURS = max(1, int(os.getenv("BACKUP_INTERVAL_HOURS", "24")))
-BOT_PUBLIC_NAME = os.getenv("BOT_PUBLIC_NAME", "Kino bot")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",") if x.strip()]
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0"))
+PORT = int(os.getenv("PORT", "10000"))
+DATA_FILE = "data.json"
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN ENV kiritilmagan.")
+CATS = {
+    "kino": "🎬 Kino",
+    "serial": "📺 Serial",
+    "anime": "🎌 Anime",
+    "multik": "🧸 Multik",
+    "drama": "🎭 Drama",
+}
 
-if BACKUP_CHANNEL_ID:
-    try:
-        BACKUP_CHANNEL_ID = int(BACKUP_CHANNEL_ID)
-    except ValueError:
-        pass  # @username ko'rinishidagi kanal IDsi ham qabul qilinadi.
+DEFAULT_SETTINGS = {
+    "baholash": True,
+    "buyurtmalar": True,
+    "himoya": False,
+    "til": "uz",
+    "support": "",
+    "oy_narx": 9000,
+    "umr_narx": 44440,
+    "karta": "",
+    "karta_egasi": "",
+}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-log = logging.getLogger("kino-bot")
-
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
-
-# =========================
-# DATABASE
-# =========================
-# Barcha ma'lumotlar faqat RAMdagi SQLite xotirasida turadi.
-# Faylga yozilmaydi: Render qayta ishga tushsa, JSON zaxiradan tiklanadi.
-_MEMORY_DB = sqlite3.connect(":memory:", check_same_thread=False)
-_MEMORY_DB.row_factory = sqlite3.Row
-_MEMORY_DB.execute("PRAGMA foreign_keys = ON")
-
-def db():
-    return _MEMORY_DB
-
-def init_db():
-    with db() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            joined_at TEXT NOT NULL,
-            vip_until TEXT,
-            referrer INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS titles(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            kind TEXT NOT NULL DEFAULT 'serial',
-            description TEXT DEFAULT '',
-            poster_file_id TEXT,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS episodes(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title_id INTEGER NOT NULL REFERENCES titles(id) ON DELETE CASCADE,
-            episode_no INTEGER NOT NULL,
-            file_id TEXT NOT NULL,
-            media_type TEXT NOT NULL,
-            caption TEXT DEFAULT '',
-            access TEXT NOT NULL DEFAULT 'free',
-            created_at TEXT NOT NULL,
-            UNIQUE(title_id, episode_no)
-        );
-        CREATE TABLE IF NOT EXISTS mandatory_channels(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT NOT NULL UNIQUE,
-            invite_url TEXT NOT NULL,
-            title TEXT DEFAULT 'Kanal'
-        );
-        CREATE TABLE IF NOT EXISTS payments(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            plan_name TEXT NOT NULL,
-            amount INTEGER NOT NULL,
-            duration_days INTEGER NOT NULL,
-            receipt_file_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            decided_at TEXT,
-            decided_by INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS audit_logs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            details TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS vip_history(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            payment_id INTEGER,
-            days INTEGER NOT NULL,
-            granted_by INTEGER NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """)
-        defaults = {
-            "card_number": "KARTA_RAQAMINI_SOZLAMALARDAN_KIRITING",
-            "card_owner": "Karta egasi",
-            "plan_30_price": "8888",
-            "plan_90_price": "20000",
-            "plan_180_price": "35000",
-            "plan_30_name": "1 oylik",
-            "plan_90_name": "3 oylik",
-            "plan_180_name": "6 oylik",
-        }
-        for k, v in defaults.items():
-            con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
-
-def setting(key, default=""):
-    with db() as con:
-        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
-
-def set_setting(key, value):
-    with db() as con:
-        con.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
-
-def log_action(actor, action, details=""):
-    with db() as con:
-        con.execute(
-            "INSERT INTO audit_logs(actor_id,action,details,created_at) VALUES(?,?,?,?)",
-            (actor, action, details, now_iso())
-        )
-
-def now_utc():
-    return datetime.now(timezone.utc)
 
 def now_iso():
-    return now_utc().isoformat()
+    return datetime.now().isoformat(timespec="seconds")
 
-def is_admin(uid: int) -> bool:
-    return uid in (OWNER_ID, DEVELOPER_ID)
 
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_ID
+def money(n):
+    return f"{int(n):,}".replace(",", " ")
 
-def get_user(uid):
-    with db() as con:
-        return con.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 
-def is_vip(uid):
-    user = get_user(uid)
-    if not user or not user["vip_until"]:
-        return False
-    try:
-        return datetime.fromisoformat(user["vip_until"]) > now_utc()
-    except ValueError:
-        return False
+class DB:
+    def __init__(self):
+        self.users = {}
+        self.movies = {}
+        self.channels = []
+        self.settings = dict(DEFAULT_SETTINGS)
+        self.receipts = {}
+        self.complaints = []
+        self.banned = []
+        self._rid = 0
 
-def register_user(user, referrer=None):
-    with db() as con:
-        con.execute("""
-        INSERT INTO users(user_id,username,first_name,joined_at,referrer)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name
-        """, (user.id, user.username or "", user.first_name or "", now_iso(), referrer))
+    def to_dict(self):
+        return {
+            "users": self.users,
+            "movies": self.movies,
+            "channels": self.channels,
+            "settings": self.settings,
+            "receipts": self.receipts,
+            "complaints": self.complaints,
+            "banned": self.banned,
+            "rid": self._rid,
+            "saved_at": now_iso(),
+        }
 
-def grant_vip(uid, days, granted_by, payment_id=None):
-    user = get_user(uid)
-    start = now_utc()
-    if user and user["vip_until"]:
+    def load_dict(self, d):
+        self.users = d.get("users", {})
+        self.movies = d.get("movies", {})
+        self.channels = d.get("channels", [])
+        self.settings = {**DEFAULT_SETTINGS, **d.get("settings", {})}
+        self.receipts = d.get("receipts", {})
+        self.complaints = d.get("complaints", [])
+        self.banned = d.get("banned", [])
+        self._rid = d.get("rid", 0)
+
+    def save(self):
         try:
-            old = datetime.fromisoformat(user["vip_until"])
-            if old > start:
-                start = old
-        except ValueError:
-            pass
-    until = (start + timedelta(days=days)).isoformat()
-    with db() as con:
-        con.execute("UPDATE users SET vip_until=? WHERE user_id=?", (until, uid))
-        con.execute(
-            "INSERT INTO vip_history(user_id,payment_id,days,granted_by,created_at) VALUES(?,?,?,?,?)",
-            (uid, payment_id, days, granted_by, now_iso())
-        )
-    return until
-
-# =========================
-# KEYBOARDS
-# =========================
-def ikb(rows):
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def main_kb():
-    return ikb([
-        [InlineKeyboardButton(text="🎬 Kino qidirish", callback_data="search"),
-         InlineKeyboardButton(text="📚 Mundarija", callback_data="catalog")],
-        [InlineKeyboardButton(text="💎 VIP obuna", callback_data="vip"),
-         InlineKeyboardButton(text="👤 Profilim", callback_data="profile")],
-        [InlineKeyboardButton(text="ℹ️ Qo‘llanma", callback_data="help")]
-    ])
-
-def back_kb(dest="home"):
-    return ikb([[InlineKeyboardButton(text="⬅️ Orqaga", callback_data=dest)]])
-
-def admin_kb():
-    return ikb([
-        [InlineKeyboardButton(text="➕ Kino/serial qo‘shish", callback_data="adm_add_title")],
-        [InlineKeyboardButton(text="➕ Qism qo‘shish", callback_data="adm_add_episode"),
-         InlineKeyboardButton(text="🗑 O‘chirish", callback_data="adm_delete")],
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats"),
-         InlineKeyboardButton(text="📣 Kanallar", callback_data="adm_channels")],
-        [InlineKeyboardButton(text="💳 VIP sozlamalari", callback_data="adm_vip_settings")],
-        [InlineKeyboardButton(text="📦 Zaxira olish", callback_data="adm_backup"),
-         InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="adm_restore")]
-    ])
-
-# =========================
-# SUBSCRIPTION CHECK
-# =========================
-async def missing_channels(uid):
-    with db() as con:
-        channels = con.execute("SELECT * FROM mandatory_channels ORDER BY id").fetchall()
-    missing = []
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(ch["chat_id"], uid)
-            status = getattr(member, "status", "")
-            if status in ("left", "kicked"):
-                missing.append(ch)
-            elif status == "restricted" and not getattr(member, "is_member", False):
-                missing.append(ch)
-        except Exception as e:
-            log.warning("Kanal tekshiruvi xatosi %s: %s", ch["chat_id"], e)
-            # Bot kanal admini bo'lmasa tekshiruv ishonchli bo'lmaydi.
-            missing.append(ch)
-    return missing
-
-async def send_join_prompt(message_or_call, missing):
-    rows = []
-    for ch in missing:
-        rows.append([InlineKeyboardButton(text=f"➕ {ch['title']}", url=ch["invite_url"])])
-    rows.append([InlineKeyboardButton(text="🔄 Obunani tekshirish", callback_data="check_subs")])
-    text = "Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:"
-    if isinstance(message_or_call, Message):
-        await message_or_call.answer(text, reply_markup=ikb(rows))
-    else:
-        try:
-            await message_or_call.message.edit_text(text, reply_markup=ikb(rows))
-        except TelegramBadRequest:
-            await message_or_call.message.answer(text, reply_markup=ikb(rows))
-        await message_or_call.answer()
-
-class SubscriptionMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        uid = None
-        if isinstance(event, Message) and event.from_user:
-            uid = event.from_user.id
-        elif isinstance(event, CallbackQuery) and event.from_user:
-            uid = event.from_user.id
-        if not uid or is_admin(uid) or is_vip(uid):
-            return await handler(event, data)
-        # Allow start, subscription checker, and join-related callbacks.
-        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
-            return await handler(event, data)
-        if isinstance(event, CallbackQuery) and event.data == "check_subs":
-            return await handler(event, data)
-        missing = await missing_channels(uid)
-        if missing:
-            if isinstance(event, Message):
-                await send_join_prompt(event, missing)
-            else:
-                await send_join_prompt(event, missing)
-            return
-        return await handler(event, data)
-
-dp.message.middleware(SubscriptionMiddleware())
-dp.callback_query.middleware(SubscriptionMiddleware())
-
-# =========================
-# FSM
-# =========================
-class ReceiptState(StatesGroup):
-    photo = State()
-
-class AddTitle(StatesGroup):
-    title = State()
-    kind = State()
-    description = State()
-    poster = State()
-    first_episode = State()
-
-class AddEpisodes(StatesGroup):
-    choose_title = State()
-    media = State()
-
-class SearchState(StatesGroup):
-    query = State()
-
-class AddChannel(StatesGroup):
-    chat_id = State()
-    invite = State()
-    title = State()
-
-class SettingState(StatesGroup):
-    value = State()
-
-class DeleteState(StatesGroup):
-    choose = State()
-
-def extract_episode_no(text: str) -> Optional[int]:
-    if not text:
-        return None
-    patterns = [
-        r"(?:qism|episode|ep)\s*[:._\- ]\s*(\d+)",
-        r"(\d+)\s*[-._ ]?\s*(?:qism|episode|ep)\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
-
-def get_titles(query=""):
-    with db() as con:
-        if query:
-            return con.execute("SELECT * FROM titles WHERE title LIKE ? ORDER BY title LIMIT 30", (f"%{query}%",)).fetchall()
-        return con.execute("SELECT * FROM titles ORDER BY title").fetchall()
-
-def title_keyboard(titles, prefix="title"):
-    rows = []
-    for t in titles:
-        rows.append([InlineKeyboardButton(text=f"{'🎬' if t['kind']=='kino' else '📺'} {t['title']}", callback_data=f"{prefix}:{t['id']}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")])
-    return ikb(rows)
-
-async def show_title(call, title_id):
-    with db() as con:
-        title = con.execute("SELECT * FROM titles WHERE id=?", (title_id,)).fetchone()
-        eps = con.execute("SELECT * FROM episodes WHERE title_id=? ORDER BY episode_no", (title_id,)).fetchall()
-    if not title:
-        await call.answer("Topilmadi", show_alert=True)
-        return
-    lines = [f"<b>{title['title']}</b>"]
-    if title["description"]:
-        lines += ["", title["description"]]
-    lines += ["", f"📚 Qismlar: {len(eps)}"]
-    rows = []
-    if eps:
-        for ep in eps:
-            label = f"{ep['episode_no']}-qism"
-            if ep["access"] == "vip":
-                label = "💎 " + label
-            else:
-                label = "▶️ " + label
-            rows.append([InlineKeyboardButton(text=label, callback_data=f"episode:{ep['id']}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Mundarija", callback_data="catalog")])
-    rows.append([InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")])
-    if title["poster_file_id"]:
-        try:
-            await call.message.answer_photo(title["poster_file_id"], caption="\n".join(lines), reply_markup=ikb(rows))
-            await call.answer()
-            return
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, ensure_ascii=False)
         except Exception:
             pass
-    await call.message.edit_text("\n".join(lines), reply_markup=ikb(rows))
-    await call.answer()
 
-# =========================
-# START / USER FLOW
-# =========================
-@dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    await state.clear()
-    parts = (message.text or "").split(maxsplit=1)
-    referrer = None
-    if len(parts) > 1 and parts[1].isdigit():
-        candidate = int(parts[1])
-        if candidate != message.from_user.id and get_user(candidate):
-            referrer = candidate
-    register_user(message.from_user, referrer)
-    if is_admin(message.from_user.id):
-        await message.answer(f"Assalomu alaykum {message.from_user.first_name}!\n\n{BOT_PUBLIC_NAME} boshqaruv paneli.", reply_markup=main_kb())
-        return
-    missing = await missing_channels(message.from_user.id)
-    if missing:
-        await send_join_prompt(message, missing)
-        return
-    await message.answer(f"Assalomu alaykum {message.from_user.first_name}!\n\nBugun nima ko‘ramiz?", reply_markup=main_kb())
-
-@dp.callback_query(F.data == "home")
-async def home(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text("🏠 <b>Asosiy menyu</b>\n\nBugun nima ko‘ramiz?", reply_markup=main_kb())
-    await call.answer()
-
-@dp.callback_query(F.data == "check_subs")
-async def check_subs(call: CallbackQuery):
-    missing = await missing_channels(call.from_user.id)
-    if missing:
-        await call.answer("Hali barcha kanallarga obuna bo‘lmagansiz.", show_alert=True)
-        return
-    await call.answer("Obuna tasdiqlandi!")
-    await call.message.edit_text("Assalomu alaykum!\n\nBugun nima ko‘ramiz?", reply_markup=main_kb())
-
-@dp.callback_query(F.data == "help")
-async def help_page(call: CallbackQuery):
-    await call.message.edit_text(
-        "ℹ️ <b>Qo‘llanma</b>\n\n"
-        "• Kino qidirish orqali nom bo‘yicha izlang.\n"
-        "• Mundarijadan barcha kinolarni ko‘ring.\n"
-        "• 💎 belgili qismlar VIP tarifida.\n"
-        "• VIP olish uchun to‘lov chekini yuboring.",
-        reply_markup=back_kb()
-    )
-    await call.answer()
-
-@dp.callback_query(F.data == "catalog")
-async def catalog(call: CallbackQuery):
-    titles = get_titles()
-    if not titles:
-        await call.message.edit_text("Hozircha katalog bo‘sh.", reply_markup=back_kb())
-    else:
-        await call.message.edit_text("📚 <b>Kinolar va seriallar mundarijasi</b>", reply_markup=title_keyboard(titles))
-    await call.answer()
-
-@dp.callback_query(F.data == "search")
-async def search_start(call: CallbackQuery, state: FSMContext):
-    await state.set_state(SearchState.query)
-    await call.message.edit_text("🔎 Kino yoki serial nomini yozing:", reply_markup=back_kb())
-    await call.answer()
-
-@dp.message(SearchState.query)
-async def search_result(message: Message, state: FSMContext):
-    query = (message.text or "").strip()
-    titles = get_titles(query)
-    await state.clear()
-    if not titles:
-        await message.answer("Bunday nom topilmadi. Boshqa nom bilan urinib ko‘ring.", reply_markup=main_kb())
-        return
-    await message.answer("🔎 <b>Qidiruv natijalari:</b>", reply_markup=title_keyboard(titles))
-
-@dp.callback_query(F.data.startswith("title:"))
-async def title_open(call: CallbackQuery):
-    await show_title(call, int(call.data.split(":")[1]))
-
-@dp.callback_query(F.data.startswith("episode:"))
-async def episode_open(call: CallbackQuery):
-    ep_id = int(call.data.split(":")[1])
-    with db() as con:
-        ep = con.execute("SELECT e.*,t.title FROM episodes e JOIN titles t ON t.id=e.title_id WHERE e.id=?", (ep_id,)).fetchone()
-    if not ep:
-        await call.answer("Qism topilmadi.", show_alert=True)
-        return
-    if ep["access"] == "vip" and not is_vip(call.from_user.id):
-        await call.answer("Bu qism VIP uchun. VIP obuna oling.", show_alert=True)
-        await call.message.answer("💎 Bu qismni ko‘rish uchun VIP obuna kerak.", reply_markup=ikb([[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip")]]))
-        return
-    try:
-        if ep["media_type"] == "video":
-            await call.message.answer_video(ep["file_id"], caption=f"<b>{ep['title']} — {ep['episode_no']}-qism</b>")
-        elif ep["media_type"] == "document":
-            await call.message.answer_document(ep["file_id"], caption=f"<b>{ep['title']} — {ep['episode_no']}-qism</b>")
-        elif ep["media_type"] == "animation":
-            await call.message.answer_animation(ep["file_id"], caption=f"<b>{ep['title']} — {ep['episode_no']}-qism</b>")
-        else:
-            await call.message.answer_video(ep["file_id"], caption=f"<b>{ep['title']} — {ep['episode_no']}-qism</b>")
-        await call.answer()
-    except Exception as e:
-        log.exception("Media yuborilmadi: %s", e)
-        await call.answer("Videoni yuborishda xatolik.", show_alert=True)
-
-@dp.callback_query(F.data == "profile")
-async def profile(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    vip_text = "Faol 💎" if is_vip(call.from_user.id) else "Oddiy tarif"
-    until = ""
-    if user and user["vip_until"] and is_vip(call.from_user.id):
-        until = "\nVIP tugash vaqti: " + datetime.fromisoformat(user["vip_until"]).strftime("%d.%m.%Y %H:%M")
-    await call.message.edit_text(f"👤 <b>Profil</b>\nID: <code>{call.from_user.id}</code>\nTarif: {vip_text}{until}", reply_markup=back_kb())
-    await call.answer()
-
-# =========================
-# VIP PURCHASE / RECEIPTS
-# =========================
-@dp.callback_query(F.data == "vip")
-async def vip_page(call: CallbackQuery):
-    rows = []
-    for days in (30, 90, 180):
-        price = setting(f"plan_{days}_price", "0")
-        name = setting(f"plan_{days}_name", f"{days} kun")
-        rows.append([InlineKeyboardButton(text=f"💎 {name} — {price} so‘m", callback_data=f"buy:{days}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")])
-    await call.message.edit_text(
-        "💎 <b>VIP obuna</b>\n\nTarifni tanlang. To‘lovdan so‘ng chek rasmini yuboring.",
-        reply_markup=ikb(rows)
-    )
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("buy:"))
-async def buy_plan(call: CallbackQuery, state: FSMContext):
-    days = int(call.data.split(":")[1])
-    price = int(setting(f"plan_{days}_price", "0"))
-    name = setting(f"plan_{days}_name", f"{days} kun")
-    if price <= 0:
-        await call.answer("Bu tarif narxi sozlanmagan.", show_alert=True)
-        return
-    card = setting("card_number")
-    owner = setting("card_owner")
-    await state.update_data(plan_days=days, plan_price=price, plan_name=name)
-    await state.set_state(ReceiptState.photo)
-    await call.message.answer(
-        f"💳 <b>To‘lov ma’lumotlari</b>\n\n"
-        f"Tarif: {name}\nNarx: <b>{price:,} so‘m</b>\n"
-        f"Karta: <code>{card}</code>\nKarta egasi: {owner}\n\n"
-        "To‘lovni amalga oshirib, chek rasmini shu yerga yuboring."
-    )
-    await call.answer()
-
-@dp.message(ReceiptState.photo, F.photo)
-async def receipt_received(message: Message, state: FSMContext):
-    data = await state.get_data()
-    file_id = message.photo[-1].file_id
-    with db() as con:
-        cur = con.execute("""
-        INSERT INTO payments(user_id,username,plan_name,amount,duration_days,receipt_file_id,status,created_at)
-        VALUES(?,?,?,?,?,?,?,?)
-        """, (message.from_user.id, message.from_user.username or "", data["plan_name"], data["plan_price"], data["plan_days"], file_id, "pending", now_iso()))
-        payment_id = cur.lastrowid
-    await state.clear()
-    username = f"@{message.from_user.username}" if message.from_user.username else "username yo‘q"
-    caption = (
-        f"💎 <b>Yangi Premium obuna — sotib olish jarayoni</b>\n\n"
-        f"#{payment_id} · {data['plan_name']}\n"
-        f"Narx: {data['plan_price']:,} so‘m\n"
-        f"Foydalanuvchi: {username} ({message.from_user.id})\n"
-        f"Chek yuborilgan vaqt: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-        "Kartaga to‘lov tushganini tekshiring, keyin tasdiqlang yoki rad eting."
-    )
-    markup = ikb([[
-        InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"pay_ok:{payment_id}"),
-        InlineKeyboardButton(text="❌ Rad etish", callback_data=f"pay_no:{payment_id}")
-    ]])
-    for admin_id in (OWNER_ID, DEVELOPER_ID):
-        try:
-            await bot.send_photo(admin_id, file_id, caption=caption, reply_markup=markup)
-        except Exception as e:
-            log.warning("Admin %s ga chek yuborilmadi: %s", admin_id, e)
-    await message.answer("✅ Chekingiz adminlarga yuborildi. Tekshiruv natijasi bot orqali xabar qilinadi.", reply_markup=main_kb())
-
-async def payment_decision(call: CallbackQuery, payment_id: int, approved: bool):
-    if not is_admin(call.from_user.id):
-        await call.answer("Ruxsat yo‘q.", show_alert=True)
-        return
-    with db() as con:
-        payment = con.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
-        if not payment:
-            await call.answer("To‘lov topilmadi.", show_alert=True)
-            return
-        if payment["status"] != "pending":
-            await call.answer("Bu to‘lov avval ko‘rib chiqilgan.", show_alert=True)
-            return
-        status = "approved" if approved else "rejected"
-        con.execute("UPDATE payments SET status=?,decided_at=?,decided_by=? WHERE id=?", (status, now_iso(), call.from_user.id, payment_id))
-    if approved:
-        until = grant_vip(payment["user_id"], payment["duration_days"], call.from_user.id, payment_id)
-        await bot.send_message(payment["user_id"], f"✅ To‘lov tasdiqlandi!\n💎 VIP {payment['duration_days']} kunga faollashtirildi.")
-        log_action(call.from_user.id, "VIP payment approved", f"payment={payment_id}, user={payment['user_id']}, days={payment['duration_days']}")
-        result = f"✅ Tasdiqlandi — {call.from_user.full_name}, {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    else:
-        await bot.send_message(payment["user_id"], "❌ To‘lov chekingiz rad etildi. Iltimos, to‘lov ma’lumotlarini tekshirib qayta yuboring.")
-        log_action(call.from_user.id, "VIP payment rejected", f"payment={payment_id}, user={payment['user_id']}")
-        result = f"❌ Rad etildi — {call.from_user.full_name}, {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    try:
-        await call.message.edit_caption((call.message.caption or "") + "\n\n" + result, reply_markup=None)
-    except TelegramBadRequest:
-        pass
-    await call.answer("Bajarildi.")
-
-@dp.callback_query(F.data.startswith("pay_ok:"))
-async def pay_ok(call: CallbackQuery):
-    await payment_decision(call, int(call.data.split(":")[1]), True)
-
-@dp.callback_query(F.data.startswith("pay_no:"))
-async def pay_no(call: CallbackQuery):
-    await payment_decision(call, int(call.data.split(":")[1]), False)
-
-# =========================
-# ADMIN PANEL
-# =========================
-@dp.message(Command("admin"))
-async def admin_command(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    await message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_kb())
-
-@dp.callback_query(F.data == "adm_add_title")
-async def add_title_begin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    await state.clear()
-    await state.set_state(AddTitle.title)
-    await call.message.answer("Kino yoki serial nomini yuboring:")
-    await call.answer()
-
-@dp.message(AddTitle.title)
-async def add_title_name(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await state.update_data(title=message.text.strip())
-    await state.set_state(AddTitle.kind)
-    await message.answer("Turini tanlang:", reply_markup=ikb([
-        [InlineKeyboardButton(text="🎬 Kino", callback_data="kind:kino"),
-         InlineKeyboardButton(text="📺 Serial", callback_data="kind:serial")]
-    ]))
-
-@dp.callback_query(F.data.startswith("kind:"))
-async def add_title_kind(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.update_data(kind=call.data.split(":")[1])
-    await state.set_state(AddTitle.description)
-    await call.message.answer("Kino/serial tavsifini yuboring. Kerak bo‘lmasa - yozing:")
-    await call.answer()
-
-@dp.message(AddTitle.description)
-async def add_title_description(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await state.update_data(description="" if message.text.strip() == "-" else message.text.strip())
-    await state.set_state(AddTitle.poster)
-    await message.answer("Poster rasmini yuboring yoki postersiz davom etish uchun /skip yozing.")
-
-@dp.message(AddTitle.poster, F.photo)
-async def add_title_poster(message: Message, state: FSMContext):
-    await state.update_data(poster_file_id=message.photo[-1].file_id)
-    await save_new_title(message, state)
-
-@dp.message(AddTitle.poster, Command("skip"))
-async def add_title_no_poster(message: Message, state: FSMContext):
-    await state.update_data(poster_file_id=None)
-    await save_new_title(message, state)
-
-async def save_new_title(message, state):
-    data = await state.get_data()
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO titles(title,kind,description,poster_file_id,created_at) VALUES(?,?,?,?,?)",
-            (data["title"], data["kind"], data["description"], data.get("poster_file_id"), now_iso())
-        )
-        title_id = cur.lastrowid
-    await state.clear()
-    log_action(message.from_user.id, "Title added", f"id={title_id}, title={data['title']}")
-    await message.answer(
-        f"✅ <b>{data['title']}</b> qo‘shildi.\nEndi qismlarini ketma-ket yuborishingiz mumkin. Har bir video captionida qism raqami bo‘lsa, avtomatik aniqlanadi. Tugatgach /done yozing.",
-        reply_markup=ikb([[InlineKeyboardButton(text="➕ Qismlarini qo‘shish", callback_data=f"add_eps:{title_id}")],
-                          [InlineKeyboardButton(text="🛠 Admin panel", callback_data="admin_panel")]])
-    )
-
-@dp.callback_query(F.data == "admin_panel")
-async def admin_panel(call: CallbackQuery):
-    if is_admin(call.from_user.id):
-        await call.message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_kb())
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("add_eps:"))
-async def add_eps_start(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    title_id = int(call.data.split(":")[1])
-    with db() as con:
-        title = con.execute("SELECT * FROM titles WHERE id=?", (title_id,)).fetchone()
-    if not title:
-        return await call.answer("Topilmadi", show_alert=True)
-    await state.clear()
-    await state.update_data(title_id=title_id, title_name=title["title"])
-    await state.set_state(AddEpisodes.media)
-    await call.message.answer(
-        f"<b>{title['title']}</b> uchun videolarni yuboring.\n"
-        "Captionga `1-qism`, `Qism: 2` kabi raqam yozing. Raqam bo‘lmasa navbatdagi bo‘sh raqam beriladi.\n"
-        "Har bir yuborilgan qism uchun tarifni tanlang. Tugatgach /done."
-    )
-    await call.answer()
-
-@dp.callback_query(F.data == "adm_add_episode")
-async def add_episode_choose(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    titles = get_titles()
-    if not titles:
-        await call.message.answer("Avval kino yoki serial qo‘shing.")
-    else:
-        await call.message.answer("Qaysi kino/serialga qism qo‘shamiz?", reply_markup=title_keyboard(titles, "add_existing"))
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("add_existing:"))
-async def add_existing_choose(call: CallbackQuery, state: FSMContext):
-    title_id = int(call.data.split(":")[1])
-    with db() as con:
-        title = con.execute("SELECT * FROM titles WHERE id=?", (title_id,)).fetchone()
-    await state.clear()
-    await state.update_data(title_id=title_id, title_name=title["title"])
-    await state.set_state(AddEpisodes.media)
-    await call.message.answer(f"{title['title']} uchun qismlarni yuboring. Tugatgach /done.")
-    await call.answer()
-
-@dp.message(AddEpisodes.media, Command("done"))
-async def episodes_done(message: Message, state: FSMContext):
-    data = await state.get_data()
-    await state.clear()
-    await message.answer(f"✅ {data.get('title_name','')} qismlari saqlandi.", reply_markup=admin_kb())
-
-@dp.message(AddEpisodes.media, Command("cancel"))
-async def episodes_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Amal bekor qilindi.", reply_markup=admin_kb())
-
-@dp.message(AddEpisodes.media)
-async def episode_media_receive(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    media_type = None
-    file_id = None
-    if message.video:
-        media_type, file_id = "video", message.video.file_id
-    elif message.document:
-        media_type, file_id = "document", message.document.file_id
-    elif message.animation:
-        media_type, file_id = "animation", message.animation.file_id
-    else:
-        await message.answer("Video yoki video fayl yuboring. To‘xtatish: /done")
-        return
-    data = await state.get_data()
-    title_id = data["title_id"]
-    caption = message.caption or ""
-    number = extract_episode_no(caption)
-    with db() as con:
-        if number is None:
-            row = con.execute("SELECT COALESCE(MAX(episode_no),0)+1 AS n FROM episodes WHERE title_id=?", (title_id,)).fetchone()
-            number = row["n"]
-        exists = con.execute("SELECT id FROM episodes WHERE title_id=? AND episode_no=?", (title_id, number)).fetchone()
-        if exists:
-            await message.answer(f"⚠️ {number}-qism allaqachon mavjud. Caption raqamini tekshiring.")
-            return
-        con.execute("""
-        INSERT INTO episodes(title_id,episode_no,file_id,media_type,caption,access,created_at)
-        VALUES(?,?,?,?,?,?,?)
-        """, (title_id, number, file_id, media_type, caption, "free", now_iso()))
-        ep_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-    await message.answer(
-        f"✅ {number}-qism saqlandi. Endi uning tarifini tanlang:",
-        reply_markup=ikb([[
-            InlineKeyboardButton(text="🟢 Oddiy", callback_data=f"access:free:{ep_id}"),
-            InlineKeyboardButton(text="💎 VIP", callback_data=f"access:vip:{ep_id}")
-        ]])
-    )
-
-@dp.callback_query(F.data.startswith("access:"))
-async def set_episode_access(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    _, access, ep_id = call.data.split(":")
-    with db() as con:
-        con.execute("UPDATE episodes SET access=? WHERE id=?", (access, int(ep_id)))
-    await call.answer("Tarif saqlandi.")
-    try:
-        await call.message.edit_text(f"✅ Qism tarifi: {'VIP' if access=='vip' else 'Oddiy'}")
-    except TelegramBadRequest:
-        pass
-
-@dp.callback_query(F.data == "adm_delete")
-async def delete_begin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    titles = get_titles()
-    if not titles:
-        await call.message.answer("Katalog bo‘sh.")
-    else:
-        await call.message.answer("O‘chirish uchun kino/serialni tanlang:", reply_markup=title_keyboard(titles, "del_title"))
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("del_title:"))
-async def delete_title(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    title_id = int(call.data.split(":")[1])
-    with db() as con:
-        row = con.execute("SELECT title FROM titles WHERE id=?", (title_id,)).fetchone()
-        con.execute("DELETE FROM titles WHERE id=?", (title_id,))
-    log_action(call.from_user.id, "Title deleted", f"id={title_id}")
-    await call.message.edit_text(f"🗑 {row['title'] if row else 'Kino'} va uning qismlari o‘chirildi.")
-    await call.answer()
-
-# =========================
-# ADMIN CHANNEL MANAGEMENT
-# =========================
-@dp.callback_query(F.data == "adm_channels")
-async def channels_menu(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    with db() as con:
-        channels = con.execute("SELECT * FROM mandatory_channels ORDER BY id").fetchall()
-    rows = [[InlineKeyboardButton(text=f"❌ {c['title']}", callback_data=f"ch_del:{c['id']}")] for c in channels]
-    rows.append([InlineKeyboardButton(text="➕ Kanal qo‘shish", callback_data="ch_add")])
-    await call.message.answer("📣 <b>Majburiy obuna kanallari</b>\nO‘chirish uchun kanal tugmasini bosing.", reply_markup=ikb(rows))
-    await call.answer()
-
-@dp.callback_query(F.data == "ch_add")
-async def channel_add_begin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    await state.set_state(AddChannel.chat_id)
-    await call.message.answer("Kanal ID yoki @username yuboring:")
-    await call.answer()
-
-@dp.message(AddChannel.chat_id)
-async def channel_id_got(message: Message, state: FSMContext):
-    await state.update_data(chat_id=message.text.strip())
-    await state.set_state(AddChannel.invite)
-    await message.answer("Kanalga obuna bo‘lish havolasini yuboring:")
-
-@dp.message(AddChannel.invite)
-async def channel_invite_got(message: Message, state: FSMContext):
-    await state.update_data(invite_url=message.text.strip())
-    await state.set_state(AddChannel.title)
-    await message.answer("Tugmada ko‘rinadigan kanal nomini yuboring:")
-
-@dp.message(AddChannel.title)
-async def channel_title_got(message: Message, state: FSMContext):
-    data = await state.get_data()
-    with db() as con:
-        con.execute("INSERT OR REPLACE INTO mandatory_channels(chat_id,invite_url,title) VALUES(?,?,?)",
-                    (data["chat_id"], data["invite_url"], message.text.strip()))
-    await state.clear()
-    log_action(message.from_user.id, "Mandatory channel added", data["chat_id"])
-    await message.answer("✅ Kanal qo‘shildi.", reply_markup=admin_kb())
-
-@dp.callback_query(F.data.startswith("ch_del:"))
-async def channel_delete(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    ch_id = int(call.data.split(":")[1])
-    with db() as con:
-        con.execute("DELETE FROM mandatory_channels WHERE id=?", (ch_id,))
-    await call.answer("Kanal o‘chirildi.")
-    await channels_menu(call)
-
-# =========================
-# SETTINGS / STATS / DEVELOPER
-# =========================
-@dp.callback_query(F.data == "adm_vip_settings")
-async def vip_settings(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    text = (
-        "💳 <b>VIP sozlamalari</b>\n\n"
-        f"Karta: <code>{setting('card_number')}</code>\n"
-        f"Karta egasi: {setting('card_owner')}\n"
-        f"30 kun: {setting('plan_30_price')} so‘m\n"
-        f"90 kun: {setting('plan_90_price')} so‘m\n"
-        f"180 kun: {setting('plan_180_price')} so‘m\n\n"
-        "O‘zgartirish uchun tugmani tanlang."
-    )
-    rows = [
-        [InlineKeyboardButton(text="Karta raqami", callback_data="set:card_number"),
-         InlineKeyboardButton(text="Karta egasi", callback_data="set:card_owner")],
-        [InlineKeyboardButton(text="30 kun narxi", callback_data="set:plan_30_price"),
-         InlineKeyboardButton(text="90 kun narxi", callback_data="set:plan_90_price")],
-        [InlineKeyboardButton(text="180 kun narxi", callback_data="set:plan_180_price")],
-    ]
-    await call.message.answer(text, reply_markup=ikb(rows))
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("set:"))
-async def setting_begin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    key = call.data.split(":", 1)[1]
-    await state.update_data(setting_key=key)
-    await state.set_state(SettingState.value)
-    await call.message.answer(f"{key} uchun yangi qiymatni yuboring:")
-    await call.answer()
-
-@dp.message(SettingState.value)
-async def setting_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    key = data["setting_key"]
-    old = setting(key)
-    value = message.text.strip()
-    if key.startswith("plan_") and not value.isdigit():
-        await message.answer("Narx faqat raqam bo‘lishi kerak. Qayta yuboring.")
-        return
-    set_setting(key, value)
-    await state.clear()
-    log_action(message.from_user.id, "Setting changed", f"{key}: {old} -> {value}")
-    # Muhim sozlama o'zgarishi haqida ikkinchi boshqaruvchiga xabar.
-    for target in (OWNER_ID, DEVELOPER_ID):
-        if target != message.from_user.id:
+    def load_local(self):
+        if os.path.exists(DATA_FILE):
             try:
-                await bot.send_message(target, f"⚙️ Muhim sozlama o‘zgardi.\nKim: {message.from_user.id}\n{key}: {old} → {value}")
+                with open(DATA_FILE, encoding="utf-8") as f:
+                    self.load_dict(json.load(f))
             except Exception:
                 pass
-    await message.answer("✅ Sozlama saqlandi.", reply_markup=admin_kb())
 
-@dp.callback_query(F.data == "adm_stats")
-async def stats(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo‘q.", show_alert=True)
-    with db() as con:
-        users = con.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-        titles = con.execute("SELECT COUNT(*) n FROM titles").fetchone()["n"]
-        episodes = con.execute("SELECT COUNT(*) n FROM episodes").fetchone()["n"]
-        pending = con.execute("SELECT COUNT(*) n FROM payments WHERE status='pending'").fetchone()["n"]
-        approved = con.execute("SELECT COUNT(*) n FROM payments WHERE status='approved'").fetchone()["n"]
-        vip = con.execute("SELECT COUNT(*) n FROM users WHERE vip_until>?", (now_iso(),)).fetchone()["n"]
-        refs = con.execute("SELECT COUNT(*) n FROM users WHERE referrer IS NOT NULL").fetchone()["n"]
-    await call.message.answer(
-        f"📊 <b>Statistika</b>\n\nObunachilar: {users}\nKino/serial: {titles}\nQismlar: {episodes}\nFaol VIP: {vip}\nTasdiqlangan to‘lovlar: {approved}\nKutilayotgan chek: {pending}\nTaklif orqali kelganlar: {refs}"
-    )
-    await call.answer()
+    def user(self, uid, name="", username=""):
+        u = self.users.get(str(uid))
+        if u is None:
+            u = {
+                "name": name,
+                "username": username,
+                "joined": now_iso(),
+                "vip_until": None,
+                "vip_life": False,
+            }
+            self.users[str(uid)] = u
+        else:
+            if name:
+                u["name"] = name
+            if username:
+                u["username"] = username
+        return u
 
-@dp.message(Command("developer"))
-async def developer_panel(message: Message):
-    if message.from_user.id != DEVELOPER_ID:
-        return  # Not developer: intentionally no response.
-    await message.answer(
-        "🧰 <b>Developer texnik paneli</b>\n\n"
-        "Bu panelda bot holati va zaxiralar boshqariladi.\n"
-        "Buyruqlar: /devstats, /backup, /botstatus\n"
-        "Owner boshqaruv huquqlari o‘zgarishsiz qoladi."
-    )
-
-@dp.message(Command("devstats"))
-async def dev_stats(message: Message):
-    if message.from_user.id != DEVELOPER_ID:
-        return
-    with db() as con:
-        logs = con.execute("SELECT actor_id,action,details,created_at FROM audit_logs ORDER BY id DESC LIMIT 10").fetchall()
-    lines = ["🧾 <b>Oxirgi muhim amallar</b>"]
-    for row in logs:
-        lines.append(f"\n{row['created_at'][:16]} | {row['actor_id']} | {row['action']} | {row['details']}")
-    await message.answer("\n".join(lines))
-
-@dp.message(Command("botstatus"))
-async def bot_status(message: Message):
-    if message.from_user.id not in (OWNER_ID, DEVELOPER_ID):
-        return
-    await message.answer("🟢 Bot ishlayapti.")
-
-# =========================
-# JSON BACKUP / RESTORE VIA TELEGRAM CHANNEL
-# =========================
-BACKUP_TABLES = [
-    "users", "titles", "episodes", "mandatory_channels", "payments",
-    "settings", "audit_logs", "vip_history"
-]
+    def next_rid(self):
+        self._rid += 1
+        return self._rid
 
 
-def build_backup_json() -> bytes:
-    """RAMdagi barcha jadvallarni bitta JSON faylga yig'adi."""
-    payload = {
-        "format": "kino_serial_bot_json_backup",
-        "version": 1,
-        "created_at": now_iso(),
-        "tables": {}
-    }
-    con = db()
-    for table in BACKUP_TABLES:
-        rows = con.execute(f"SELECT * FROM {table}").fetchall()
-        payload["tables"][table] = [dict(row) for row in rows]
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+db = DB()
 
 
-async def create_backup():
-    if not BACKUP_CHANNEL_ID:
-        raise RuntimeError("BACKUP_CHANNEL_ID ENVga kanal IDsi yozilmagan.")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"kino_bot_backup_{stamp}.json"
-    data = build_backup_json()
-    document = BufferedInputFile(data, filename=filename)
-    sent = await bot.send_document(
-        chat_id=BACKUP_CHANNEL_ID,
-        document=document,
-        caption=f"📦 Kino bot JSON zaxirasi\n🕒 {stamp}\n📁 Barcha ma'lumotlar"
-    )
-    log.info("JSON backup Telegram kanaliga yuborildi: message_id=%s", sent.message_id)
-    return filename
-
-
-def restore_backup_json(raw: bytes):
-    """JSON fayldagi ma'lumotlarni RAM bazasiga to'liq qayta yuklaydi."""
-    try:
-        payload = json.loads(raw.decode("utf-8-sig"))
-    except Exception as exc:
-        raise ValueError("JSON faylni o'qib bo'lmadi yoki fayl buzilgan.") from exc
-
-    if payload.get("format") != "kino_serial_bot_json_backup" or payload.get("version") != 1:
-        raise ValueError("Bu fayl ushbu botning mos JSON zaxirasi emas.")
-    tables = payload.get("tables")
-    if not isinstance(tables, dict):
-        raise ValueError("Zaxira faylida jadvallar topilmadi.")
-    for table in BACKUP_TABLES:
-        if table not in tables or not isinstance(tables[table], list):
-            raise ValueError(f"Zaxirada {table} ma'lumotlari yo'q.")
-
-    con = db()
-    con.execute("PRAGMA foreign_keys = OFF")
-    try:
-        with con:
-            for table in reversed(BACKUP_TABLES):
-                con.execute(f"DELETE FROM {table}")
-            for table in BACKUP_TABLES:
-                rows = tables[table]
-                if not rows:
-                    continue
-                columns = [r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
-                for row in rows:
-                    if not isinstance(row, dict) or any(k not in columns for k in row):
-                        raise ValueError(f"{table} jadvalidagi ma'lumotlar noto'g'ri.")
-                    keys = list(row.keys())
-                    placeholders = ",".join(["?"] * len(keys))
-                    col_sql = ",".join(keys)
-                    con.execute(
-                        f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
-                        [row[k] for k in keys]
-                    )
-    finally:
-        con.execute("PRAGMA foreign_keys = ON")
-    return sum(len(tables[t]) for t in BACKUP_TABLES)
-
-
-class RestoreState(StatesGroup):
-    json_file = State()
-
-
-@dp.callback_query(F.data == "adm_backup")
-async def manual_backup(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo'q.", show_alert=True)
-    await call.answer("JSON zaxira tayyorlanmoqda...")
-    try:
-        filename = await create_backup()
-        await call.message.answer(f"✅ Zaxira kanalga yuborildi: <code>{filename}</code>")
-    except Exception as exc:
-        log.exception("Manual JSON backup failed")
-        await call.message.answer(f"❌ Zaxira yaratilmadi: {exc}")
-
-
-@dp.callback_query(F.data == "adm_restore")
-async def restore_begin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Ruxsat yo'q.", show_alert=True)
-    await state.set_state(RestoreState.json_file)
-    await call.message.answer(
-        "♻️ <b>Zaxirani tiklash</b>\n\n"
-        "Backup kanalidan kerakli JSON faylni yuklab oling va shu chatga hujjat qilib yuboring.\n"
-        "Diqqat: tiklash hozirgi RAMdagi ma'lumotlarni zaxiradagi ma'lumotlar bilan almashtiradi."
-    )
-    await call.answer()
-
-
-@dp.message(Command("restore"))
-async def restore_command(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await state.set_state(RestoreState.json_file)
-    await message.answer(
-        "Backup kanalidan JSON zaxirani yuklab olib, shu yerga hujjat qilib yuboring.\n"
-        "Tiklash joriy ma'lumotlarni almashtiradi."
-    )
-
-
-@dp.message(RestoreState.json_file, F.document)
-async def restore_file_received(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    doc = message.document
-    if not (doc.file_name or "").lower().endswith(".json"):
-        await message.answer("Faqat .json zaxira faylini yuboring.")
-        return
-    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
-        await message.answer("Fayl juda katta. 20 MB dan kichik JSON yuboring.")
-        return
-    try:
-        stream = await bot.download(doc.file_id)
-        raw = stream.getvalue() if hasattr(stream, "getvalue") else stream.read()
-        count = restore_backup_json(raw)
-        await state.clear()
-        log_action(message.from_user.id, "JSON backup restored", f"{count} rows")
-        await message.answer(
-            f"✅ Zaxira tiklandi.\nJami tiklangan yozuvlar: <b>{count}</b>",
-            reply_markup=admin_kb()
-        )
-    except Exception as exc:
-        log.exception("JSON restore failed")
-        await message.answer(f"❌ Zaxirani tiklab bo'lmadi: {exc}")
-
-
-@dp.message(RestoreState.json_file)
-async def restore_file_expected(message: Message):
-    if is_admin(message.from_user.id):
-        await message.answer("Iltimos, JSON zaxira faylini hujjat (Document) sifatida yuboring.")
-
-
-@dp.message(Command("backup"))
-async def backup_command(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        filename = await create_backup()
-        await message.answer(f"✅ JSON zaxira kanalga yuborildi: <code>{filename}</code>")
-    except Exception as exc:
-        log.exception("Backup command failed")
-        await message.answer(f"❌ Zaxira yaratilmadi: {exc}")
-
-
-async def backup_loop():
-    while True:
+def is_vip(uid) -> bool:
+    u = db.users.get(str(uid))
+    if not u:
+        return False
+    if u.get("vip_life"):
+        return True
+    vu = u.get("vip_until")
+    if vu:
         try:
-            await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
-            await create_backup()
-            log.info("Avtomatik JSON zaxira kanalga yuborildi")
-        except asyncio.CancelledError:
-            raise
+            return datetime.fromisoformat(vu) > datetime.now()
         except Exception:
-            log.exception("Automatic JSON backup failed")
+            return False
+    return False
 
-# =========================
-# ERROR HANDLING / MAIN
-# =========================
-@dp.errors()
-async def errors_handler(event):
-    log.exception("Update error: %s", event.exception)
-    return True
+
+def rating_of(movie):
+    r = movie.get("ratings", {})
+    if not r:
+        return "0.0", 0
+    return f"{sum(r.values()) / len(r):.1f}", len(r)
+
+
+def parse_part(caption):
+    """Sarlavhadan (fasl, qism) o'qiydi.
+    '5-qism' -> (1, 5); '3 fasl 5 qism' -> (3, 5); 's3e5' -> (3, 5); '3x5' -> (3, 5).
+    Fasl ko'rsatilmasa 1 deb olinadi."""
+    if not caption:
+        return None
+    c = caption.lower().replace("сезон", "fasl").replace("серия", "qism")
+    season, episode = None, None
+    m = re.search(r"(\d+)\s*[-.]?\s*fasl", c)
+    if m:
+        season = int(m.group(1))
+    m = re.search(r"(\d+)\s*[-.]?\s*qism", c)
+    if m:
+        episode = int(m.group(1))
+    if season is None and episode is None:
+        m = re.search(r"s(\d+)[^0-9]*e(\d+)", c)
+        if m:
+            season, episode = int(m.group(1)), int(m.group(2))
+    if season is None and episode is None:
+        m = re.search(r"(\d+)\s*[xх]\s*(\d+)", c)
+        if m:
+            season, episode = int(m.group(1)), int(m.group(2))
+    if episode is None:
+        m = re.search(r"(\d+)", c)
+        if m:
+            episode = int(m.group(1))
+    if episode is None:
+        return None
+    if season is None:
+        season = 1
+    return season, episode
+
+
+def part_label(season, episode, multi_season):
+    if multi_season:
+        return f"{season} fasl {episode}-qism"
+    return f"{episode}-qism"
+
+
+def ch_link(ch):
+    ch = str(ch)
+    if ch.startswith("@"):
+        return f"https://t.me/{ch[1:]}"
+    if ch.startswith("-100"):
+        return f"https://t.me/c/{ch[4:]}"
+    return ch
+
+
+# ---------------- klaviaturalar ----------------
+
+def main_kb(uid):
+    rows = [
+        [KeyboardButton(text="🎬 Kinolar"), KeyboardButton(text="🔎 Qidiruv")],
+        [KeyboardButton(text="💎 Premium"), KeyboardButton(text="📝 Shikoyat")],
+        [KeyboardButton(text="⚙️ Sozlamalar")],
+    ]
+    if uid in ADMIN_IDS:
+        rows.append([KeyboardButton(text="👑 Admin panel")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def admin_kb():
+    b = [
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="a:stat"),
+         InlineKeyboardButton(text="🎬 Kinolar", callback_data="a:movies")],
+        [InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="a:addm"),
+         InlineKeyboardButton(text="✂️ Qism qo'shish", callback_data="a:parts")],
+        [InlineKeyboardButton(text="📢 Xabar yuborish", callback_data="a:bcast"),
+         InlineKeyboardButton(text="📣 Homiy kanallar", callback_data="a:chan")],
+        [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="a:users"),
+         InlineKeyboardButton(text="🚫 Ban/Unban", callback_data="a:ban")],
+        [InlineKeyboardButton(text="🛒 Buyurtmalar", callback_data="a:orders"),
+         InlineKeyboardButton(text="⚠️ Shikoyatlar", callback_data="a:comp")],
+        [InlineKeyboardButton(text="📈 Analitika", callback_data="a:anal"),
+         InlineKeyboardButton(text="📤 Excel eksport", callback_data="a:expe")],
+        [InlineKeyboardButton(text="📥 Excel import", callback_data="a:expi"),
+         InlineKeyboardButton(text="💎 Premium", callback_data="a:prem")],
+        [InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="a:sett"),
+         InlineKeyboardButton(text="💾 Zaxira nuska", callback_data="a:back")],
+        [InlineKeyboardButton(text="« Bosh menyu", callback_data="a:home")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=b)
+
+
+def sub_kb():
+    rows = [[InlineKeyboardButton(text=f"📢 {c}", url=ch_link(c))] for c in db.channels]
+    rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="checksub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def premium_kb():
+    if not db.settings["buyurtmalar"]:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧾 1 oylik sotib olish", callback_data="pay:oy")],
+        [InlineKeyboardButton(text="♾ Umrlik sotib olish", callback_data="pay:umr")],
+    ])
+
+
+def premium_text():
+    s = db.settings
+    t = (f"💎 <b>Premium obuna</b>\n\n"
+         f"🧾 1 oylik: <b>{money(s['oy_narx'])} so'm</b>\n"
+         f"♾ Umrlik: <b>{money(s['umr_narx'])} so'm</b>\n\n"
+         f"💳 Karta: <code>{s['karta']}</code>\n"
+         f"👤 Karta egasi: {s['karta_egasi']}\n\n"
+         f"To'lov qiling va chekni (rasm/fayl) shu yerga yuboring. "
+         f"Admin tasdiqlagach VIP ochiladi.")
+    if not s["buyurtmalar"]:
+        t += "\n\n<i>⚠️ Hozircha buyurtmalar o'chirilgan.</i>"
+    return t
+
+
+def movies_kb(page=0, per=10):
+    items = list(db.movies.values())
+    total = len(items)
+    chunk = items[page * per:(page + 1) * per]
+    rows = []
+    for mv in chunk:
+        label = f"{CATS.get(mv['category'], '🎬')} {mv['name']}"[:60]
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"mv:{mv['code']}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"ml:{page - 1}"))
+    if (page + 1) * per < total:
+        nav.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"ml:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_kb():
+    s = db.settings
+
+    def mark(x):
+        return "✅" if x else "❌"
+
+    rows = [
+        [InlineKeyboardButton(text=f"📝 Baholash: {mark(s['baholash'])}", callback_data="stg:baholash"),
+         InlineKeyboardButton(text=f"🛒 Buyurtmalar: {mark(s['buyurtmalar'])}", callback_data="stg:buyurtmalar")],
+        [InlineKeyboardButton(text=f"🔒 Himoya: {mark(s['himoya'])}", callback_data="stg:himoya"),
+         InlineKeyboardButton(text=f"🌐 Til: {s.get('til', 'uz')}", callback_data="ste:til")],
+        [InlineKeyboardButton(text="📞 Support", callback_data="ste:support"),
+         InlineKeyboardButton(text=f"📣 Homiy kanallar: {len(db.channels)}", callback_data="a:chan")],
+        [InlineKeyboardButton(text="💳 Karta", callback_data="ste:karta"),
+         InlineKeyboardButton(text="👤 Karta egasi", callback_data="ste:karta_egasi")],
+        [InlineKeyboardButton(text=f"💎 1 oy: {money(s['oy_narx'])}", callback_data="ste:oy_narx"),
+         InlineKeyboardButton(text=f"♾ Umrlik: {money(s['umr_narx'])}", callback_data="ste:umr_narx")],
+        [InlineKeyboardButton(text="« Admin panel", callback_data="a:panel")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_text():
+    s = db.settings
+    return ("⚙️ <b>Sozlamalar</b>\n\n"
+            f"📝 Baholash: {'✅' if s['baholash'] else '❌'}\n"
+            f"🛒 Buyurtmalar: {'✅' if s['buyurtmalar'] else '❌'}\n"
+            f"🔒 Kontentni himoyalash: {'✅' if s['himoya'] else '❌'}\n"
+            f"🌐 Standart til: {s.get('til', 'uz')}\n"
+            f"📞 Support: {s['support'] or 'kiritilmagan'}\n"
+            f"💳 Karta raqami: {s['karta'] or 'kiritilmagan'}\n"
+            f"👤 Karta egasi: {s['karta_egasi'] or 'kiritilmagan'}\n"
+            f"💎 1 oylik narx: {money(s['oy_narx'])} so'm\n"
+            f"💎 Umrlik narx: {money(s['umr_narx'])} so'm\n"
+            f"📣 Kanal havolasi: {len(db.channels)} ta kanal")
+
+
+# ---------------- middleware ----------------
+
+class GuardMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is None or user.id in ADMIN_IDS:
+            return await handler(event, data)
+
+        db.user(user.id, user.full_name, user.username or "")
+        u = db.users[str(user.id)]
+        if u.get("banned") or user.id in db.banned:
+            if isinstance(event, Message):
+                await event.answer("🚫 Siz bloklangansiz.")
+            else:
+                await event.answer("🚫 Siz bloklangansiz.", show_alert=True)
+            return
+
+        st = data.get("state")
+        state_name = ""
+        if st is not None:
+            state_name = (await st.get_state()) or ""
+
+        need_check = False
+        if isinstance(event, CallbackQuery):
+            if event.data != "checksub":
+                need_check = True
+        elif isinstance(event, Message) and not state_name:
+            need_check = True
+
+        if need_check and db.channels:
+            bot_ = data["bot"]
+            bad = []
+            for ch in db.channels:
+                try:
+                    member = await bot_.get_chat_member(ch, user.id)
+                    if member.status in ("left", "kicked"):
+                        bad.append(ch)
+                except Exception:
+                    pass
+            if bad:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("⚠️ Avval kanallarga obuna bo'ling!", show_alert=True)
+                    await bot_.send_message(
+                        user.id,
+                        "❌ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
+                        reply_markup=sub_kb(),
+                    )
+                else:
+                    await event.answer(
+                        "❌ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
+                        reply_markup=sub_kb(),
+                    )
+                return
+        return await handler(event, data)
+
+
+# ---------------- FSM ----------------
+
+class AddMovie(StatesGroup):
+    code = State()
+    name = State()
+    photo = State()
+    desc = State()
+
+
+class AddParts(StatesGroup):
+    adding = State()
+
+
+class Bcast(StatesGroup):
+    content = State()
+
+
+class ChanAdd(StatesGroup):
+    text = State()
+
+
+class BanFlow(StatesGroup):
+    uid = State()
+
+
+class SetFlow(StatesGroup):
+    value = State()
+
+
+class ImpFlow(StatesGroup):
+    wait = State()
+
+
+class UserSearch(StatesGroup):
+    q = State()
+
+
+class UserComplaint(StatesGroup):
+    text = State()
+
+
+class UserPay(StatesGroup):
+    wait = State()
+
+
+class AdminFilter(Filter):
+    async def __call__(self, obj):
+        u = getattr(obj, "from_user", None)
+        return u is not None and u.id in ADMIN_IDS
+
+
+bot = Bot(BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
+dp.message.outer_middleware(GuardMiddleware())
+dp.callback_query.outer_middleware(GuardMiddleware())
+
+router_user = Router()
+router_admin = Router()
+router_admin.message.filter(AdminFilter())
+router_admin.callback_query.filter(AdminFilter())
+dp.include_router(router_admin)
+dp.include_router(router_user)
+
+
+# ================= FOYDALANUVCHI =================
+
+@router_user.message(CommandStart())
+async def start(m: Message, state: FSMContext):
+    await state.clear()
+    db.user(m.from_user.id, m.from_user.full_name, m.from_user.username or "")
+    db.save()
+    await m.answer(
+        "🎬 <b>Kino botiga xush kelibsiz!</b>\n\n"
+        "Kinolarni ko'rish uchun menyudan foydalaning.",
+        reply_markup=main_kb(m.from_user.id),
+    )
+
+
+@router_user.message(F.text == "🎬 Kinolar", StateFilter(None))
+async def list_movies(m: Message):
+    if not db.movies:
+        await m.answer("🎬 Hozircha kino qo'shilmagan.")
+        return
+    await m.answer("🎬 <b>Kinolar ro'yxati:</b>", reply_markup=movies_kb(0))
+
+
+@router_user.callback_query(F.data.startswith("ml:"))
+async def movies_page(cq: CallbackQuery):
+    page = int(cq.data.split(":")[1])
+    try:
+        await cq.message.edit_text("🎬 <b>Kinolar ro'yxati:</b>", reply_markup=movies_kb(page))
+    except TelegramBadRequest:
+        await cq.message.answer("🎬 <b>Kinolar ro'yxati:</b>", reply_markup=movies_kb(page))
+    await cq.answer()
+
+
+@router_user.callback_query(F.data.startswith("mv:"))
+async def movie_info(cq: CallbackQuery, state: FSMContext):
+    await state.clear()
+    code = cq.data.split(":", 1)[1]
+    mv = db.movies.get(code)
+    if not mv:
+        await cq.answer("❌ Kino topilmadi.")
+        return
+    mv["views"] = mv.get("views", 0) + 1
+    db.save()
+    avg, cnt = rating_of(mv)
+    vip_only = mv.get("tariff") == "vip"
+    locked = vip_only and not is_vip(cq.from_user.id)
+    text = (f"{CATS.get(mv['category'], '🎬')} <b>{mv['name']}</b>\n"
+            f"⭐ {avg} ({cnt})   👁 {mv['views']}   📁 {len(mv['parts'])}\n"
+            f"{'🔒 VIP kontent' if vip_only else '🆓 Bepul'}\n\n{mv.get('desc', '')}")
+    kb = []
+    if locked:
+        kb.append([InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="pr")])
+    else:
+        pairs = sorted((int(k.split(":")[0]), int(k.split(":")[1])) for k in mv["parts"].keys())
+        multi = any(s > 1 for s, _ in pairs)
+        for i in range(0, len(pairs), 5):
+            kb.append([InlineKeyboardButton(
+                text=part_label(s, e, multi),
+                callback_data=f"pt:{code}:{s}:{e}") for s, e in pairs[i:i + 5]])
+    if cq.from_user.id in ADMIN_IDS:
+        kb.append([InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del:{code}")])
+    kb.append([InlineKeyboardButton(text="« Orqaga", callback_data="ml:0")])
+    try:
+        await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except TelegramBadRequest:
+        await cq.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cq.answer()
+
+
+@router_user.callback_query(F.data.startswith("pt:"))
+async def watch_part(cq: CallbackQuery):
+    _, code, season, ep = cq.data.split(":")
+    key = f"{season}:{ep}"
+    mv = db.movies.get(code)
+    if not mv:
+        await cq.answer("❌ Kino topilmadi.")
+        return
+    if mv.get("tariff") == "vip" and not is_vip(cq.from_user.id):
+        await cq.answer("🔒 Bu kontent faqat VIP uchun!", show_alert=True)
+        return
+    fid = mv["parts"].get(key)
+    if not fid:
+        await cq.answer("❌ Qism topilmadi.")
+        return
+    label = part_label(int(season), int(ep), int(season) > 1)
+    await cq.message.answer_video(
+        video=fid,
+        caption=f"{mv['name']} — {label}",
+        protect_content=db.settings["himoya"],
+    )
+    mv = db.movies[code]
+    if db.settings["baholash"] and str(cq.from_user.id) not in mv.get("ratings", {}):
+        stars = [InlineKeyboardButton(text=s, callback_data=f"rt:{code}:{i}")
+                 for i, s in enumerate(["1⭐", "2⭐", "3⭐", "4⭐", "5⭐"], start=1)]
+        await cq.message.answer("🎬 Kino yoqdimi? Baho bering:",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[stars]))
+    await cq.answer()
+
+
+@router_user.callback_query(F.data.startswith("rt:"))
+async def rate_movie(cq: CallbackQuery):
+    _, code, score = cq.data.split(":")
+    mv = db.movies.get(code)
+    if not mv:
+        await cq.answer("❌ Kino topilmadi.")
+        return
+    mv.setdefault("ratings", {})[str(cq.from_user.id)] = int(score)
+    db.save()
+    await cq.message.edit_text("✅ Bahongiz qabul qilindi. Rahmat!")
+    await cq.answer()
+
+
+@router_user.message(F.text == "🔎 Qidiruv", StateFilter(None))
+async def search_start(m: Message, state: FSMContext):
+    await state.set_state(UserSearch.q)
+    await m.answer("🔎 Kino nomi yoki kodini yozing:")
+
+
+@router_user.message(UserSearch.q, F.text)
+async def search_run(m: Message, state: FSMContext):
+    q = m.text.strip().lower()
+    found = [mv for mv in db.movies.values()
+             if q in mv["name"].lower() or q == mv["code"].lower()]
+    await state.clear()
+    if not found:
+        await m.answer("❌ Hech narsa topilmadi.")
+        return
+    rows = [[InlineKeyboardButton(text=f"{CATS.get(mv['category'], '🎬')} {mv['name']}"[:60],
+                                  callback_data=f"mv:{mv['code']}")] for mv in found[:20]]
+    await m.answer("🔎 Topildi:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router_user.message(F.text == "💎 Premium", StateFilter(None))
+@router_user.callback_query(F.data == "pr")
+async def premium_menu(event):
+    kb = premium_kb()
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.message.edit_text(premium_text(), reply_markup=kb)
+        except TelegramBadRequest:
+            await event.message.answer(premium_text(), reply_markup=kb)
+        await event.answer()
+    else:
+        await event.answer(premium_text(), reply_markup=kb)
+
+
+@router_user.callback_query(F.data.startswith("pay:"))
+async def pay_start(cq: CallbackQuery, state: FSMContext):
+    if not db.settings["buyurtmalar"]:
+        await cq.answer("⚠️ Hozircha buyurtmalar o'chirilgan.", show_alert=True)
+        return
+    tariff = cq.data.split(":")[1]
+    await state.set_state(UserPay.wait)
+    await state.update_data(tariff=tariff)
+    name = "1 oylik" if tariff == "oy" else "Umrlik"
+    await cq.message.answer(
+        f"🧾 <b>{name}</b> tarifi tanlandi.\n\n"
+        "To'lov qiling va chekni (rasm yoki fayl) shu yerga yuboring.\n"
+        "Bekor qilish: /bekor",
+    )
+    await cq.answer()
+
+
+@router_user.message(UserPay.wait, F.photo | F.document)
+async def pay_receipt(m: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    tariff = data.get("tariff", "oy")
+    rid = db.next_rid()
+    db.receipts[str(rid)] = {
+        "uid": m.from_user.id,
+        "tariff": tariff,
+        "status": "wait",
+        "at": now_iso(),
+    }
+    db.save()
+    name = "1 oylik" if tariff == "oy" else "Umrlik"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"apr:{rid}"),
+         InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rej:{rid}")],
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await m.copy_to(admin_id)
+            await bot.send_message(
+                admin_id,
+                f"🧾 <b>Yangi to'lov</b>\n🆔 {rid}\n👤 {m.from_user.full_name} "
+                f"(<code>{m.from_user.id}</code>)\n📦 Tarif: {name}",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+    await state.clear()
+    await m.answer("🧾 Chek yuborildi. Admin tasdiqlagach VIP ochiladi. Kuting...")
+
+
+@router_user.message(F.text == "📝 Shikoyat", StateFilter(None))
+async def complaint_start(m: Message, state: FSMContext):
+    await state.set_state(UserComplaint.text)
+    await m.answer("📝 Shikoyatingizni yozing (yoki /bekor):")
+
+
+@router_user.message(UserComplaint.text, F.text)
+async def complaint_send(m: Message, state: FSMContext, bot: Bot):
+    db.complaints.append({"uid": m.from_user.id, "text": m.text, "at": now_iso()})
+    db.save()
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"⚠️ <b>Yangi shikoyat</b>\n👤 {m.from_user.full_name} "
+                f"(<code>{m.from_user.id}</code>)\n💬 {m.text}",
+            )
+        except Exception:
+            pass
+    await state.clear()
+    await m.answer("✅ Shikoyatingiz yuborildi.")
+
+
+@router_user.message(F.text == "⚙️ Sozlamalar", StateFilter(None))
+async def user_settings(m: Message):
+    s = db.settings
+    vip = "♾ Umrlik" if db.users.get(str(m.from_user.id), {}).get("vip_life") else \
+        ("🧾 VIP" if is_vip(m.from_user.id) else "❌ yo'q")
+    text = (f"⚙️ <b>Sozlamalar</b>\n\n🌐 Til: {s.get('til', 'uz')}\n"
+            f"💎 VIP holati: {vip}\n"
+            f"📞 Support: {s['support'] or 'kiritilmagan'}")
+    await m.answer(text)
+
+
+@router_user.callback_query(F.data == "checksub")
+async def check_sub(cq: CallbackQuery, bot: Bot):
+    bad = []
+    for ch in db.channels:
+        try:
+            member = await bot.get_chat_member(ch, cq.from_user.id)
+            if member.status in ("left", "kicked"):
+                bad.append(ch)
+        except Exception:
+            pass
+    if bad:
+        await cq.answer("❌ Hali obuna bo'lmagansiz!", show_alert=True)
+        return
+    await cq.answer("✅ Rahmat!")
+    await cq.message.answer("🏠 Bosh menyu", reply_markup=main_kb(cq.from_user.id))
+
+
+# ================= ADMIN =================
+
+@router_admin.message(F.text == "👑 Admin panel", StateFilter(None))
+@router_admin.message(Command("admin"))
+async def admin_panel(m: Message):
+    await m.answer("👑 <b>Admin panel</b>", reply_markup=admin_kb())
+
+
+@router_admin.callback_query(F.data == "a:home")
+async def admin_home(cq: CallbackQuery):
+    await cq.message.delete()
+    await cq.message.answer("🏠 Bosh menyu", reply_markup=main_kb(cq.from_user.id))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "a:panel")
+async def admin_back(cq: CallbackQuery):
+    await cq.message.edit_text("👑 <b>Admin panel</b>", reply_markup=admin_kb())
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "a:stat")
+async def a_stat(cq: CallbackQuery):
+    today = datetime.now().date().isoformat()
+    new_today = sum(1 for u in db.users.values() if u.get("joined", "").startswith(today))
+    vip_count = sum(1 for uid in db.users if is_vip(int(uid)))
+    parts_total = sum(len(mv["parts"]) for mv in db.movies.values())
+    pending = sum(1 for r in db.receipts.values() if r["status"] == "wait")
+    text = ("📊 <b>Statistika</b>\n\n"
+            f"👥 Jami foydalanuvchilar: {len(db.users)}\n"
+            f"🆕 Bugun qo'shilgan: {new_today}\n"
+            f"💎 VIP foydalanuvchilar: {vip_count}\n"
+            f"🎬 Kinolar: {len(db.movies)}\n"
+            f"📁 Jami qismlar: {parts_total}\n"
+            f"⏳ Kutilayotgan to'lovlar: {pending}\n"
+            f"📣 Kanallar: {len(db.channels)}\n"
+            f"🚫 Bloklangan: {len(db.banned) + sum(1 for u in db.users.values() if u.get('banned'))}")
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "a:movies")
+async def a_movies(cq: CallbackQuery):
+    if not db.movies:
+        await cq.answer("Kino yo'q.")
+        return
+    await cq.message.edit_text("🎬 <b>Barcha kinolar:</b>", reply_markup=movies_kb(0))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data.startswith("del:"))
+async def a_del(cq: CallbackQuery):
+    code = cq.data.split(":")[1]
+    if code in db.movies:
+        del db.movies[code]
+        db.save()
+        await cq.answer("🗑 O'chirildi.")
+        try:
+            await cq.message.edit_text("🎬 <b>Barcha kinolar:</b>", reply_markup=movies_kb(0))
+        except TelegramBadRequest:
+            pass
+    else:
+        await cq.answer("Topilmadi.")
+
+
+# ---- Kino qo'shish ----
+
+@router_admin.callback_query(F.data == "a:addm")
+async def a_addm(cq: CallbackQuery, state: FSMContext):
+    rows = [[InlineKeyboardButton(text=t, callback_data=f"cat:{k}")] for k, t in CATS.items()]
+    rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
+    await cq.message.edit_text("🎬 Qaysi turda qo'shamiz?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await state.set_state(AddMovie.code)
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data.startswith("cat:"))
+async def a_cat(cq: CallbackQuery, state: FSMContext):
+    await state.update_data(category=cq.data.split(":")[1])
+    await cq.message.edit_text("🔢 Kino kodi (unikal, masalan: 101):")
+    await state.set_state(AddMovie.code)
+    await cq.answer()
+
+
+@router_admin.message(AddMovie.code, F.text)
+async def a_code(m: Message, state: FSMContext):
+    code = m.text.strip()
+    if not code or code in db.movies:
+        await m.answer("❌ Kod band yoki noto'g'ri. Boshqa kod kiriting:")
+        return
+    await state.update_data(code=code)
+    await m.answer("📝 Kino nomini kiriting:")
+    await state.set_state(AddMovie.name)
+
+
+@router_admin.message(AddMovie.name, F.text)
+async def a_name(m: Message, state: FSMContext):
+    await state.update_data(name=m.text.strip())
+    await m.answer("🖼 Rasm yuboring:")
+    await state.set_state(AddMovie.photo)
+
+
+@router_admin.message(AddMovie.photo, F.photo)
+async def a_photo(m: Message, state: FSMContext):
+    await state.update_data(photo=m.photo[-1].file_id)
+    await m.answer("📄 Tavfsif yozing:")
+    await state.set_state(AddMovie.desc)
+
+
+@router_admin.message(AddMovie.desc, F.text)
+async def a_desc(m: Message, state: FSMContext):
+    data = await state.get_data()
+    db.movies[data["code"]] = {
+        "code": data["code"],
+        "name": data["name"],
+        "category": data.get("category", "kino"),
+        "desc": m.text.strip(),
+        "photo": data.get("photo", ""),
+        "tariff": "oddiy",
+        "parts": {},
+        "views": 0,
+        "ratings": {},
+    }
+    db.save()
+    await state.clear()
+    await m.answer(
+        f"✅ <b>{data['name']}</b> qo'shildi!\n\n"
+        f"Qismlar qo'shish: Admin panel → ✂️ Qism qo'shish",
+        reply_markup=admin_kb(),
+    )
+
+
+# ---- Qism qo'shish ----
+
+@router_admin.callback_query(F.data == "a:parts")
+async def a_parts(cq: CallbackQuery, state: FSMContext):
+    await cq.message.edit_text("✂️ Qism qo'shiladigan kino kodini yozing:")
+    await state.set_state(AddParts.adding)
+    await state.update_data(step="code")
+    await cq.answer()
+
+
+@router_admin.message(AddParts.adding, F.text)
+async def a_parts_text(m: Message, state: FSMContext):
+    data = await state.get_data()
+    if data.get("step") == "code":
+        code = m.text.strip()
+        if code not in db.movies:
+            await m.answer("❌ Bunday kodli kino yo'q. Qayta kiriting:")
+            return
+        mv = db.movies[code]
+        await state.update_data(step="tariff", code=code)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆓 Oddiy (bepul)", callback_data="trf:oddiy"),
+             InlineKeyboardButton(text="💎 VIP uchun", callback_data="trf:vip")],
+        ])
+        await m.answer(f"🎬 <b>{mv['name']}</b> — qismlar qaysi tarif uchun?", reply_markup=kb)
+    elif m.text.strip() == "✅ Tayyor":
+        code = data.get("code", "")
+        mv = db.movies.get(code)
+        await state.clear()
+        n = len(mv["parts"]) if mv else 0
+        await m.answer(f"✅ Tayyor! Jami {n} qism saqlandi.", reply_markup=main_kb(m.from_user.id))
+
+
+@router_admin.callback_query(F.data.startswith("trf:"))
+async def a_parts_tariff(cq: CallbackQuery, state: FSMContext):
+    tariff = cq.data.split(":")[1]
+    await state.update_data(tariff=tariff, step="adding")
+    mv = db.movies[(await state.get_data())["code"]]
+    mv["tariff"] = tariff
+    db.save()
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Tayyor")]], resize_keyboard=True)
+    await cq.message.answer(
+        "📤 Endi videolarni yuboring.\n"
+        "Har bir media sarlavhasida qism raqami bo'lsin — bot o'zi o'qib taxlaydi.\n"
+        "Masalan: <b>1-qism</b>, <b>2-qism</b> ...\n"
+        "Fasl bo'lsa: <b>3 fasl 5 qism</b> (yoki s3e5, 3x5)\n\n"
+        "Tugatgach «✅ Tayyor» tugmasini bosing.",
+        reply_markup=kb,
+    )
+    await cq.answer()
+
+
+@router_admin.message(AddParts.adding, F.video | F.document)
+async def a_parts_media(m: Message, state: FSMContext):
+    data = await state.get_data()
+    if data.get("step") != "adding":
+        await m.answer("❌ Avval kino kodini kiriting.")
+        return
+    code = data["code"]
+    mv = db.movies.get(code)
+    if not mv:
+        await m.answer("❌ Kino topilmadi.")
+        await state.clear()
+        return
+    parsed = parse_part(m.caption)
+    if parsed is None:
+        await m.answer("❌ Sarlavhasida qism raqami topilmadi.\n"
+                       "Masalan: <b>5-qism</b> yoki <b>3 fasl 5 qism</b>")
+        return
+    season, ep = parsed
+    fid = m.video.file_id if m.video else m.document.file_id
+    mv["parts"][f"{season}:{ep}"] = fid
+    db.save()
+    await m.answer(f"✅ {part_label(season, ep, season > 1)} qo'shildi (jami: {len(mv['parts'])}). "
+                   f"Davom eting yoki «✅ Tayyor» bosing.")
+
+
+# ---- Xabar yuborish ----
+
+@router_admin.callback_query(F.data == "a:bcast")
+async def a_bcast(cq: CallbackQuery, state: FSMContext):
+    await cq.message.edit_text("📢 Yuboriladigan xabarni yozing (barcha foydalanuvchilarga):")
+    await state.set_state(Bcast.content)
+    await cq.answer()
+
+
+@router_admin.message(Bcast.content)
+async def a_bcast_run(m: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    ok, fail = 0, 0
+    for uid in list(db.users.keys()):
+        try:
+            await m.copy_to(int(uid))
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.04)
+    await m.answer(f"✅ Yuborildi: {ok}\n❌ Xatolik: {fail}", reply_markup=admin_kb())
+
+
+# ---- Homiy kanallar ----
+
+@router_admin.callback_query(F.data == "a:chan")
+async def a_chan(cq: CallbackQuery):
+    rows = []
+    for i, ch in enumerate(db.channels):
+        rows.append([InlineKeyboardButton(text=f"❌ {ch}", callback_data=f"chdel:{i}")])
+    rows.append([InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="chadd")])
+    rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
+    text = ("📣 <b>Majburiy obuna kanallari</b>\n\n" +
+            ("\n".join(f"• {c}" for c in db.channels) if db.channels else "Hozircha kanal qo'shilmagan."))
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "chadd")
+async def a_chan_add(cq: CallbackQuery, state: FSMContext):
+    await cq.message.edit_text("Kanal username yoki ID yuboring (masalan: @Ruhshunos_PanjaraOrtida yoki -100123...):")
+    await state.set_state(ChanAdd.text)
+    await cq.answer()
+
+
+@router_admin.message(ChanAdd.text, F.text)
+async def a_chan_save(m: Message, state: FSMContext):
+    ch = m.text.strip()
+    if not (ch.startswith("@") or ch.startswith("-100") or ch.lstrip("-").isdigit()):
+        await m.answer("❌ Noto'g'ri format. Masalan: @kanal yoki -1001234567890")
+        return
+    if ch in db.channels:
+        await m.answer("❌ Bu kanal allaqachon qo'shilgan.")
+        return
+    db.channels.append(ch)
+    db.save()
+    await state.clear()
+    await m.answer(f"✅ {ch} qo'shildi.", reply_markup=admin_kb())
+
+
+@router_admin.callback_query(F.data.startswith("chdel:"))
+async def a_chan_del(cq: CallbackQuery):
+    i = int(cq.data.split(":")[1])
+    if 0 <= i < len(db.channels):
+        removed = db.channels.pop(i)
+        db.save()
+        await cq.answer(f"❌ {removed} o'chirildi.")
+        rows = [[InlineKeyboardButton(text=f"❌ {c}", callback_data=f"chdel:{j}")] for j, c in enumerate(db.channels)]
+        rows.append([InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="chadd")])
+        rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
+        try:
+            await cq.message.edit_text("📣 <b>Majburiy obuna kanallari</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        except TelegramBadRequest:
+            pass
+    else:
+        await cq.answer("Topilmadi.")
+
+
+# ---- Foydalanuvchilar ----
+
+def users_csv():
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "name", "username", "joined", "vip"])
+    for uid, u in db.users.items():
+        w.writerow([uid, u.get("name", ""), u.get("username", ""), u.get("joined", ""),
+                    "VIP" if is_vip(int(uid)) else ""])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def movies_csv():
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["code", "name", "category", "tariff", "parts", "views"])
+    for c, mv in db.movies.items():
+        w.writerow([c, mv["name"], mv["category"], mv["tariff"], len(mv["parts"]), mv["views"]])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+@router_admin.callback_query(F.data == "a:users")
+async def a_users(cq: CallbackQuery):
+    vip_count = sum(1 for uid in db.users if is_vip(int(uid)))
+    last = list(db.users.items())[-5:]
+    text = (f"👥 <b>Foydalanuvchilar</b>\n\nJami: {len(db.users)}\nVIP: {vip_count}\n\n"
+            f"Oxirgi 5 ta:\n" + "\n".join(f"• {u.get('name','?')} (<code>{uid}</code>)" for uid, u in last))
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 CSV yuklab olish", callback_data="a:ucsv")],
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "a:ucsv")
+async def a_ucsv(cq: CallbackQuery):
+    await cq.message.answer_document(
+        BufferedInputFile(users_csv(), filename="foydalanuvchilar.csv"),
+        caption="👥 Foydalanuvchilar ro'yxati (Excel'da ochiladi)",
+    )
+    await cq.answer()
+
+
+# ---- Ban / Unban ----
+
+@router_admin.callback_query(F.data == "a:ban")
+async def a_ban(cq: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Banlash", callback_data="bn:1"),
+         InlineKeyboardButton(text="✅ Bandan chiqarish", callback_data="bn:0")],
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")],
+    ])
+    await cq.message.edit_text("🚫 <b>Ban / Unban</b>\nTanlang:", reply_markup=kb)
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data.startswith("bn:"))
+async def a_ban_pick(cq: CallbackQuery, state: FSMContext):
+    await state.update_data(ban=cq.data.split(":")[1] == "1")
+    await cq.message.edit_text("Foydalanuvchi ID sini yozing:")
+    await state.set_state(BanFlow.uid)
+    await cq.answer()
+
+
+@router_admin.message(BanFlow.uid, F.text)
+async def a_ban_apply(m: Message, state: FSMContext):
+    if not m.text.strip().lstrip("-").isdigit():
+        await m.answer("❌ Faqat raqam kiriting.")
+        return
+    uid = int(m.text.strip())
+    data = await state.get_data()
+    if data.get("ban"):
+        u = db.user(uid)
+        u["banned"] = True
+        if uid in db.banned:
+            db.banned.remove(uid)
+        msg = f"🚫 {uid} bloklandi."
+    else:
+        u = db.users.get(str(uid))
+        if u:
+            u["banned"] = False
+        if uid in db.banned:
+            db.banned.remove(uid)
+        msg = f"✅ {uid} bandan chiqarildi."
+    db.save()
+    await state.clear()
+    await m.answer(msg, reply_markup=admin_kb())
+
+
+# ---- Buyurtmalar ----
+
+@router_admin.callback_query(F.data == "a:orders")
+async def a_orders(cq: CallbackQuery):
+    pending = [(int(rid), r) for rid, r in db.receipts.items() if r["status"] == "wait"]
+    if not pending:
+        await cq.answer("🛒 Kutilayotgan to'lov yo'q.")
+        return
+    rows = []
+    for rid, r in pending:
+        name = "1 oylik" if r["tariff"] == "oy" else "Umrlik"
+        rows.append([InlineKeyboardButton(text=f"🆔{rid} 👤{r['uid']} 📦{name}", callback_data="noop")])
+        rows.append([InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"apr:{rid}"),
+                     InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rej:{rid}")])
+    rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
+    await cq.message.edit_text(f"🛒 <b>Kutilayotgan to'lovlar: {len(pending)}</b>",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data.startswith("apr:"))
+async def a_approve(cq: CallbackQuery, bot: Bot):
+    rid = cq.data.split(":")[1]
+    r = db.receipts.get(rid)
+    if not r or r["status"] != "wait":
+        await cq.answer("Allaqachon ko'rilgan.")
+        return
+    uid = r["uid"]
+    u = db.user(uid)
+    if r["tariff"] == "oy":
+        u["vip_until"] = (datetime.now() + timedelta(days=30)).isoformat(timespec="seconds")
+        u["vip_life"] = False
+        label = "1 oylik"
+    else:
+        u["vip_life"] = True
+        label = "umrlik"
+    r["status"] = "ok"
+    db.save()
+    try:
+        await bot.send_message(uid, f"🎉 Tabriklaymiz! <b>{label}</b> premium obunangiz faollashtirildi. 🎬")
+    except Exception:
+        pass
+    await cq.message.edit_text(cq.message.text + f"\n\n✅ Tasdiqlandi → <code>{uid}</code>")
+    await cq.answer("✅ Tasdiqlandi.")
+
+
+@router_admin.callback_query(F.data.startswith("rej:"))
+async def a_reject(cq: CallbackQuery, bot: Bot):
+    rid = cq.data.split(":")[1]
+    r = db.receipts.get(rid)
+    if not r or r["status"] != "wait":
+        await cq.answer("Allaqachon ko'rilgan.")
+        return
+    r["status"] = "rej"
+    db.save()
+    try:
+        await bot.send_message(r["uid"], "❌ To'lovingiz rad etildi. Qayta urinib ko'ring yoki supportga yozing.")
+    except Exception:
+        pass
+    await cq.message.edit_text(cq.message.text + f"\n\n❌ Rad etildi → <code>{r['uid']}</code>")
+    await cq.answer("❌ Rad etildi.")
+
+
+# ---- Shikoyatlar ----
+
+@router_admin.callback_query(F.data == "a:comp")
+async def a_comp(cq: CallbackQuery):
+    items = db.complaints[-10:]
+    text = "⚠️ <b>Shikoyatlar</b>\n\n"
+    text += "\n\n".join(f"👤 <code>{c['uid']}</code> ({c['at']})\n💬 {c['text']}" for c in items) if items \
+        else "Shikoyatlar yo'q."
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Tozalash", callback_data="comp:clr")],
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "comp:clr")
+async def a_comp_clr(cq: CallbackQuery):
+    db.complaints = []
+    db.save()
+    await cq.message.edit_text("⚠️ <b>Shikoyatlar</b>\n\nTozalandi.",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                   [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+    await cq.answer("🗑 Tozalandi.")
+
+
+# ---- Analitika ----
+
+@router_admin.callback_query(F.data == "a:anal")
+async def a_anal(cq: CallbackQuery):
+    lines = []
+    for i in range(6, -1, -1):
+        day = (datetime.now() - timedelta(days=i)).date().isoformat()
+        cnt = sum(1 for u in db.users.values() if u.get("joined", "").startswith(day))
+        lines.append(f"{day}: {cnt} ta")
+    parts_total = sum(len(mv["parts"]) for mv in db.movies.values())
+    views_total = sum(mv["views"] for mv in db.movies.values())
+    text = ("📈 <b>Analitika (oxirgi 7 kun)</b>\n\n" + "\n".join(lines) +
+            f"\n\n🎬 Kinolar: {len(db.movies)}\n📁 Qismlar: {parts_total}\n👁 Ko'rilgan: {views_total}")
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+    await cq.answer()
+
+
+# ---- Excel eksport / import ----
+
+@router_admin.callback_query(F.data == "a:expe")
+async def a_expe(cq: CallbackQuery):
+    await cq.message.answer_document(
+        BufferedInputFile(users_csv(), filename="foydalanuvchilar.csv"))
+    await cq.message.answer_document(
+        BufferedInputFile(movies_csv(), filename="kinolar.csv"))
+    await cq.answer("📤 Yuklab olindi.")
+
+
+@router_admin.callback_query(F.data == "a:expi")
+async def a_expi(cq: CallbackQuery, state: FSMContext):
+    await cq.message.edit_text(
+        "📥 CSV fayl yuboring (Excel'dan saqlangan).\n"
+        "Birinchi ustun — foydalanuvchi ID lar bo'lishi kerak.")
+    await state.set_state(ImpFlow.wait)
+    await cq.answer()
+
+
+@router_admin.message(ImpFlow.wait, F.document)
+async def a_impi_run(m: Message, state: FSMContext, bot: Bot):
+    try:
+        raw = await bot.download(m.document.file_id)
+        text = raw.read().decode("utf-8-sig", errors="ignore")
+        reader = csv.reader(io.StringIO(text))
+        added = 0
+        for i, row in enumerate(reader):
+            if not row:
+                continue
+            cell = row[0].strip()
+            if i == 0 and not cell.lstrip("-").isdigit():
+                continue
+            if cell.lstrip("-").isdigit():
+                db.user(int(cell))
+                added += 1
+        db.save()
+        await m.answer(f"✅ {added} ta foydalanuvchi import qilindi.", reply_markup=admin_kb())
+    except Exception:
+        await m.answer("❌ Faylni o'qib bo'lmadi. Qayta yuboring.")
+        return
+    await state.clear()
+
+
+# ---- Premium panel ----
+
+@router_admin.callback_query(F.data == "a:prem")
+async def a_prem(cq: CallbackQuery):
+    vips = [(uid, u) for uid, u in db.users.items() if is_vip(int(uid))]
+    text = (f"💎 <b>Premium</b>\n\nFaol VIP foydalanuvchilar: {len(vips)}\n"
+            f"1 oylik: {money(db.settings['oy_narx'])} so'm\n"
+            f"Umrlik: {money(db.settings['umr_narx'])} so'm\n\n"
+            "Narxni o'zgartirish: ⚙️ Sozlamalar")
+    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 VIP ro'yxati (CSV)", callback_data="a:vcsv")],
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "a:vcsv")
+async def a_vcsv(cq: CallbackQuery):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "name", "username", "vip"])
+    for uid, u in db.users.items():
+        if is_vip(int(uid)):
+            kind = "umrlik" if u.get("vip_life") else (u.get("vip_until") or "")
+            w.writerow([uid, u.get("name", ""), u.get("username", ""), kind])
+    await cq.message.answer_document(
+        BufferedInputFile(buf.getvalue().encode("utf-8-sig"), filename="vip_foydalanuvchilar.csv"))
+    await cq.answer()
+
+
+# ---- Sozlamalar ----
+
+@router_admin.callback_query(F.data == "a:sett")
+async def a_sett(cq: CallbackQuery):
+    await cq.message.edit_text(settings_text(), reply_markup=settings_kb())
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data.startswith("stg:"))
+async def a_stg_toggle(cq: CallbackQuery):
+    key = cq.data.split(":")[1]
+    db.settings[key] = not db.settings.get(key, False)
+    db.save()
+    await cq.message.edit_text(settings_text(), reply_markup=settings_kb())
+    await cq.answer()
+
+
+STE_PROMPTS = {
+    "til": "🌐 Standart tilni kiriting (masalan: uz):",
+    "support": "📞 Support username kiriting (masalan: @SupportBot):",
+    "karta": "💳 Karta raqamini kiriting:",
+    "karta_egasi": "👤 Karta egasini kiriting:",
+    "oy_narx": "💎 1 oylik narxni kiriting (faqat raqam):",
+    "umr_narx": "💎 Umrlik narxni kiriting (faqat raqam):",
+}
+
+
+@router_admin.callback_query(F.data.startswith("ste:"))
+async def a_ste_edit(cq: CallbackQuery, state: FSMContext):
+    key = cq.data.split(":")[1]
+    await state.update_data(key=key)
+    await cq.message.edit_text(STE_PROMPTS[key])
+    await state.set_state(SetFlow.value)
+    await cq.answer()
+
+
+@router_admin.message(SetFlow.value, F.text)
+async def a_ste_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    key = data["key"]
+    val = m.text.strip()
+    if key in ("oy_narx", "umr_narx"):
+        if not val.isdigit():
+            await m.answer("❌ Faqat raqam kiriting:")
+            return
+        db.settings[key] = int(val)
+    else:
+        db.settings[key] = val
+    db.save()
+    await state.clear()
+    await m.answer("✅ Saqlandi.", reply_markup=admin_kb())
+
+
+# ---- Zaxira nuska ----
+
+@router_admin.callback_query(F.data == "a:back")
+async def a_backup_menu(cq: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💾 Zahira olish", callback_data="back:send")],
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")],
+    ])
+    text = ("💾 <b>Zaxira nuska</b>\n\n"
+            "• <b>Zaxira olish</b> — barcha ma'lumot JSON ko'rinishida zaxira kanalga yuboriladi.\n"
+            "• <b>Tiklash</b> — zaxira kanaldagi .json faylni shu botga yuboring, "
+            "ma'lumotlar avtomatik tiklanadi.")
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "back:send")
+async def a_backup_send(cq: CallbackQuery, bot: Bot):
+    data = json.dumps(db.to_dict(), ensure_ascii=False, indent=1).encode("utf-8")
+    fname = f"zahira_{datetime.now():%Y%m%d_%H%M%S}.json"
+    doc = BufferedInputFile(data, filename=fname)
+    sent = False
+    if BACKUP_CHANNEL_ID:
+        try:
+            await bot.send_document(BACKUP_CHANNEL_ID, doc, caption=f"💾 Zaxira nuska\n🕒 {now_iso()}")
+            sent = True
+        except Exception:
+            sent = False
+    if not sent:
+        doc2 = BufferedInputFile(json.dumps(db.to_dict(), ensure_ascii=False, indent=1).encode("utf-8"),
+                                 filename=fname)
+        await cq.message.answer_document(doc2, caption="💾 Zaxira nuska (kanalga yuborilmadi, env tekshiring)")
+    await cq.answer("💾 Zaxira kanalga yuborildi." if sent else "⚠️ Zaxira kanalga yuborilmadi.")
+    db.save()
+
+
+@router_admin.message(F.document, StateFilter(None))
+async def a_restore(m: Message, bot: Bot):
+    if not (m.document.file_name or "").endswith(".json"):
+        return
+    try:
+        raw = await bot.download(m.document.file_id)
+        d = json.loads(raw.read().decode("utf-8"))
+        db.load_dict(d)
+        db.save()
+        await m.answer(
+            f"✅ Zaxira tiklandi!\n"
+            f"👥 Foydalanuvchilar: {len(db.users)}\n"
+            f"🎬 Kinolar: {len(db.movies)}\n"
+            f"📁 Qismlar: {sum(len(mv['parts']) for mv in db.movies.values())}",
+            reply_markup=admin_kb(),
+        )
+    except Exception:
+        await m.answer("❌ Fayl o'qilmadi. To'g'ri zaxira faylini yuboring.")
+
+
+# ---- Bekor ----
+
+@router_user.message(Command("bekor"))
+@router_admin.message(Command("bekor"))
+async def cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("❌ Bekor qilindi.", reply_markup=main_kb(m.from_user.id))
+
+
+@router_user.callback_query(F.data == "noop")
+async def noop(cq: CallbackQuery):
+    await cq.answer()
+
+
+# ---------------- ishga tushirish ----------------
+
+async def health(request):
+    return web.Response(text="ok")
+
 
 async def main():
-    init_db()
-    # Ma'lumotlar RAMda turadi; davriy JSON zaxira kanalga yuboriladi.
-    task = asyncio.create_task(backup_loop())
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        task.cancel()
-        await bot.session.close()
+    db.load_local()
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, "✅ Bot ishga tushdi.")
+        except Exception:
+            pass
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
