@@ -271,8 +271,8 @@ def ch_link(ch):
 def main_kb(uid):
     rows = [
         [KeyboardButton(text="🎬 Kinolar"), KeyboardButton(text="🔎 Qidiruv")],
-        [KeyboardButton(text="💎 Premium"), KeyboardButton(text="📝 Shikoyat")],
-        [KeyboardButton(text="⚙️ Sozlamalar")],
+        [KeyboardButton(text="💎 Premium"), KeyboardButton(text="❤️ Sevimlilarim")],
+        [KeyboardButton(text="📝 Shikoyat"), KeyboardButton(text="⚙️ Sozlamalar")],
     ]
     if uid in ADMIN_IDS:
         rows.append([KeyboardButton(text="👑 Admin panel")])
@@ -329,6 +329,30 @@ def premium_text():
     if not s["buyurtmalar"]:
         t += "\n\n<i>⚠️ Hozircha buyurtmalar o'chirilgan.</i>"
     return t
+
+
+def watch_kb(uid, code, page=0, per=30):
+    mv = db.movies.get(code)
+    if not mv:
+        return main_kb(uid)
+    pairs = sorted((int(k.split(":")[0]), int(k.split(":")[1])) for k in mv["parts"].keys())
+    multi = any(s > 1 for s, _ in pairs)
+    chunk = pairs[page * per:(page + 1) * per]
+    rows = []
+    for i in range(0, len(chunk), 5):
+        rows.append([KeyboardButton(text=part_label(s, e, multi)) for s, e in chunk[i:i + 5]])
+    if (page + 1) * per < len(pairs):
+        rows.append([KeyboardButton(text="Keyingi ➡️")])
+    fav = code in db.user(uid).get("favs", [])
+    sub = str(uid) in mv.get("subs", [])
+    rows.append([KeyboardButton(text="⭐ Baholash"),
+                 KeyboardButton(text="❤️ Sevimlilarga" + (" ✅" if fav else ""))])
+    rows.append([KeyboardButton(text="🔕 Yangi qismlar: o'chirish" if sub else "🔔 Yangi qismlar"),
+                 KeyboardButton(text="⚠️ Xatolik haqida")])
+    if uid in ADMIN_IDS:
+        rows.append([KeyboardButton(text="🗑 O'chirish")])
+    rows.append([KeyboardButton(text="« Orqaga"), KeyboardButton(text="🏠 Bosh menyu")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def movies_kb(page=0, per=10):
@@ -487,6 +511,10 @@ class UserPay(StatesGroup):
     wait = State()
 
 
+class UserWatch(StatesGroup):
+    open = State()
+
+
 class AdminFilter(Filter):
     async def __call__(self, obj):
         u = getattr(obj, "from_user", None)
@@ -551,28 +579,146 @@ async def movie_info(cq: CallbackQuery, state: FSMContext):
     db.save()
     avg, cnt = rating_of(mv)
     vip_only = mv.get("tariff") == "vip"
-    locked = vip_only and not is_vip(cq.from_user.id)
+    uid = cq.from_user.id
     text = (f"{CATS.get(mv['category'], '🎬')} <b>{mv['name']}</b>\n"
             f"⭐ {avg} ({cnt})   👁 {mv['views']}   📁 {len(mv['parts'])}\n"
             f"{'🔒 VIP kontent' if vip_only else '🆓 Bepul'}\n\n{mv.get('desc', '')}")
-    kb = []
-    if locked:
-        kb.append([InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="pr")])
-    else:
-        pairs = sorted((int(k.split(":")[0]), int(k.split(":")[1])) for k in mv["parts"].keys())
-        multi = any(s > 1 for s, _ in pairs)
-        for i in range(0, len(pairs), 5):
-            kb.append([InlineKeyboardButton(
-                text=part_label(s, e, multi),
-                callback_data=f"pt:{code}:{s}:{e}") for s, e in pairs[i:i + 5]])
-    if cq.from_user.id in ADMIN_IDS:
-        kb.append([InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del:{code}")])
-    kb.append([InlineKeyboardButton(text="« Orqaga", callback_data="ml:0")])
-    try:
-        await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    except TelegramBadRequest:
-        await cq.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    if vip_only and not is_vip(uid) and uid not in ADMIN_IDS:
+        await cq.message.answer(
+            text + "\n\n🔒 Bu kontent faqat VIP foydalanuvchilar uchun!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="pr")]]))
+        await cq.answer()
+        return
+    await cq.message.answer(text)
+    await state.set_state(UserWatch.open)
+    await state.update_data(code=code, page=0, step="")
+    await cq.message.answer("👇 Qismni tanlang:", reply_markup=watch_kb(uid, code, 0))
     await cq.answer()
+
+
+@router_user.message(UserWatch.open, F.text)
+async def watch_text(m: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    code = data.get("code", "")
+    uid = m.from_user.id
+    t = m.text.strip()
+
+    if t == "🏠 Bosh menyu":
+        await state.clear()
+        await m.answer("🏠 Bosh menyu", reply_markup=main_kb(uid))
+        return
+    if t == "« Orqaga":
+        await state.clear()
+        if db.movies:
+            await m.answer("🎬 <b>Kinolar ro'yxati:</b>", reply_markup=movies_kb(0))
+        else:
+            await m.answer("🏠 Bosh menyu", reply_markup=main_kb(uid))
+        return
+
+    mv = db.movies.get(code)
+    if not mv:
+        await state.clear()
+        await m.answer("❌ Kino topilmadi.", reply_markup=main_kb(uid))
+        return
+
+    if data.get("step") == "report":
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ <b>Xatolik xabari</b>\n🎬 {mv['name']} (<code>{code}</code>)\n"
+                    f"👤 {m.from_user.full_name} (<code>{uid}</code>)\n💬 {t}",
+                )
+            except Exception:
+                pass
+        await state.update_data(step="")
+        await m.answer("✅ Xabar yuborildi. Rahmat!", reply_markup=watch_kb(uid, code, data.get("page", 0)))
+        return
+
+    if t == "Keyingi ➡️":
+        page = data.get("page", 0) + 1
+        await state.update_data(page=page)
+        await m.answer(f"📄 {page + 1}-sahifa:", reply_markup=watch_kb(uid, code, page))
+        return
+
+    if t == "⭐ Baholash":
+        if not db.settings["baholash"]:
+            await m.answer("📝 Baholash hozir o'chirilgan.")
+            return
+        stars = [InlineKeyboardButton(text=s, callback_data=f"rt:{code}:{i}")
+                 for i, s in enumerate(["1⭐", "2⭐", "3⭐", "4⭐", "5⭐"], start=1)]
+        await m.answer("🎬 Baho bering:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[stars]))
+        return
+
+    if t.startswith("❤️"):
+        favs = db.user(uid).setdefault("favs", [])
+        if code in favs:
+            favs.remove(code)
+            msg = "💔 Sevimlilardan olib tashlandi."
+        else:
+            favs.append(code)
+            msg = "❤️ Sevimlilarga qo'shildi."
+        db.save()
+        await m.answer(msg, reply_markup=watch_kb(uid, code, data.get("page", 0)))
+        return
+
+    if t.startswith("🔔") or t.startswith("🔕"):
+        subs = mv.setdefault("subs", [])
+        if str(uid) in subs:
+            subs.remove(str(uid))
+            msg = "🔕 Yangi qism xabarlari o'chirildi."
+        else:
+            subs.append(str(uid))
+            msg = "🔔 Yangi qismlar chiqanda xabar beraman."
+        db.save()
+        await m.answer(msg, reply_markup=watch_kb(uid, code, data.get("page", 0)))
+        return
+
+    if t == "⚠️ Xatolik haqida":
+        await state.update_data(step="report")
+        await m.answer("⚠️ Xatolikni yozing (qaysi qism, qanday muammo):\n"
+                       "Bekor qilish: /bekor")
+        return
+
+    if t == "🗑 O'chirish" and uid in ADMIN_IDS:
+        del db.movies[code]
+        db.save()
+        await state.clear()
+        await m.answer("🗑 Kino o'chirildi.", reply_markup=main_kb(uid))
+        return
+
+    multi = any(int(k.split(":")[0]) > 1 for k in mv["parts"].keys())
+    for k, fid in mv["parts"].items():
+        s, e = k.split(":")
+        if part_label(int(s), int(e), multi) == t:
+            if mv.get("tariff") == "vip" and not is_vip(uid) and uid not in ADMIN_IDS:
+                await m.answer("🔒 Bu kontent faqat VIP uchun!")
+                return
+            await m.answer_video(
+                video=fid,
+                caption=f"{mv['name']} — {part_label(int(s), int(e), multi)}",
+                protect_content=db.settings["himoya"],
+            )
+            if db.settings["baholash"] and str(uid) not in mv.get("ratings", {}):
+                stars = [InlineKeyboardButton(text=x, callback_data=f"rt:{code}:{i}")
+                         for i, x in enumerate(["1⭐", "2⭐", "3⭐", "4⭐", "5⭐"], start=1)]
+                await m.answer("🎬 Kino yoqdimi? Baho bering:",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[stars]))
+            return
+    await m.answer("👇 Tugmalardan foydalaning.")
+
+
+@router_user.message(F.text == "❤️ Sevimlilarim", StateFilter(None))
+async def my_favs(m: Message):
+    favs = db.user(m.from_user.id).get("favs", [])
+    items = [db.movies[c] for c in favs if c in db.movies]
+    if not items:
+        await m.answer("❤️ Sevimlilar ro'yxati bo'sh.")
+        return
+    rows = [[InlineKeyboardButton(text=f"{CATS.get(mv['category'], '🎬')} {mv['name']}"[:60],
+                                  callback_data=f"mv:{mv['code']}")] for mv in items[:30]]
+    await m.answer("❤️ <b>Sevimlilarim:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router_user.callback_query(F.data.startswith("pt:"))
@@ -938,7 +1084,7 @@ async def a_parts_tariff(cq: CallbackQuery, state: FSMContext):
 
 
 @router_admin.message(AddParts.adding, F.video | F.document)
-async def a_parts_media(m: Message, state: FSMContext):
+async def a_parts_media(m: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     if data.get("step") != "adding":
         await m.answer("❌ Avval kino kodini kiriting.")
@@ -958,8 +1104,20 @@ async def a_parts_media(m: Message, state: FSMContext):
     fid = m.video.file_id if m.video else m.document.file_id
     mv["parts"][f"{season}:{ep}"] = fid
     db.save()
-    await m.answer(f"✅ {part_label(season, ep, season > 1)} qo'shildi (jami: {len(mv['parts'])}). "
+    label = part_label(season, ep, season > 1)
+    await m.answer(f"✅ {label} qo'shildi (jami: {len(mv['parts'])}). "
                    f"Davom eting yoki «✅ Tayyor» bosing.")
+    multi = any(int(k.split(":")[0]) > 1 for k in mv["parts"].keys())
+    label = part_label(season, ep, multi)
+    for suid in mv.get("subs", []):
+        try:
+            await bot.send_message(
+                int(suid),
+                f"🔔 <b>{mv['name']}</b> — yangi qism chiqdi!\n"
+                f"📥 {label} hozirdan ko'rish mumkin.",
+            )
+        except Exception:
+            pass
 
 
 # ---- Xabar yuborish ----
