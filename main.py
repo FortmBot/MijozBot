@@ -4,11 +4,20 @@ import io
 import json
 import os
 import re
+import sys
 from datetime import datetime, timedelta
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+print("[1/6] main.py yuklandi, env tekshirilmoqda...", flush=True)
 
 from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,10 +26,44 @@ from aiogram.types import (BufferedInputFile, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",") if x.strip()]
-BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0"))
-PORT = int(os.getenv("PORT", "10000"))
+print("[2/6] Kutubxonalar yuklandi.", flush=True)
+
+def _env_int(name, default=0):
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"XATO: {name} faqat raqam bo'lishi kerak, lekin '{raw}' berildi. "
+            f"Masalan: -1001234567890"
+        )
+
+
+def _env_admin_ids():
+    raw = os.getenv("ADMIN_ID", "").strip()
+    if not raw:
+        raise SystemExit("XATO: ADMIN_ID env kiritilmagan. Telegram ID ingizni yozing.")
+    ids = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.lstrip("-").isdigit():
+            raise SystemExit(f"XATO: ADMIN_ID dagi '{part}' raqam emas. Masalan: 123456789")
+        ids.append(int(part))
+    if not ids:
+        raise SystemExit("XATO: ADMIN_ID bo'sh. Telegram ID ingizni yozing.")
+    return ids
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("XATO: BOT_TOKEN env kiritilmagan. BotFather dan olingan tokenni yozing.")
+ADMIN_IDS = _env_admin_ids()
+BACKUP_CHANNEL_ID = _env_int("BACKUP_CHANNEL_ID")
+PORT = _env_int("PORT", 10000)
 DATA_FILE = "data.json"
 
 CATS = {
@@ -428,6 +471,7 @@ bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
 dp.message.outer_middleware(GuardMiddleware())
 dp.callback_query.outer_middleware(GuardMiddleware())
+print(f"[3/6] Bot yaratildi. Adminlar: {len(ADMIN_IDS)} ta, zaxira kanal: {BACKUP_CHANNEL_ID}, port: {PORT}", flush=True)
 
 router_user = Router()
 router_admin = Router()
@@ -1366,6 +1410,7 @@ async def health(request):
 
 
 async def main():
+    print("[4/6] Local ma'lumot yuklanmoqda...", flush=True)
     db.load_local()
     app = web.Application()
     app.router.add_get("/", health)
@@ -1373,8 +1418,13 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    print(f"[5/6] Health-server ishga tushdi (port {PORT})", flush=True)
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except TelegramUnauthorizedError:
+        raise SystemExit("XATO: BOT_TOKEN noto'g'ri. BotFather dan yangi token olib qo'ying.")
+    print("[6/6] Telegram bilan bog'landik. Polling boshlanmoqda...", flush=True)
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, "✅ Bot ishga tushdi.")
@@ -1384,4 +1434,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        raise SystemExit(f"Bot xato bilan to'xtadi: {type(e).__name__}: {e}")
