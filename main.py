@@ -67,15 +67,22 @@ def _health_page(request):
 
 
 def _run_health():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app = web.Application()
     app.router.add_get("/", _health_page)
-    web.run_app(app, host="0.0.0.0", port=PORT, print=None)
+    runner = web.AppRunner(app)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    loop.run_until_complete(site.start())
+    loop.run_forever()
 
 
 threading.Thread(target=_run_health, daemon=True).start()
 print(f"[3/6] Port {PORT} ochildi (health-server)", flush=True)
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -486,7 +493,7 @@ class AdminFilter(Filter):
         return u is not None and u.id in ADMIN_IDS
 
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 dp.message.outer_middleware(GuardMiddleware())
 dp.callback_query.outer_middleware(GuardMiddleware())
