@@ -2559,14 +2559,15 @@ async def a_texnik(cq: CallbackQuery):
     db.settings["texnik"] = not bool(db.settings.get("texnik", False))
     db.save()
     on = bool(db.settings["texnik"])
+    holat = "🔴 YOQILGAN" if on else "🟢 O'CHIRILGAN"
     text = ("🛠 <b>Texnik ishlar rejimi</b>\n\n"
-            f"Holat: {'🔴 YOQILGAN' if on else '🟢 O'CHIRILGAN'}\n\n"
+            "Holat: " + holat + "\n\n"
             + ("Foydalanuvchilar botga yozganda «texnik ishlar ketmoqda» deb javob oladi. "
                "Adminlar va owner botdan normal foydalanadi."
                if on else
                "Bot yana barcha foydalanuvchilar uchun ishlaydi."))
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔴 O'chirish" if on else "🟢 Yoqish",
+        [InlineKeyboardButton(text=("🔴 O'chirish" if on else "🟢 Yoqish"),
                               callback_data="a:texnik")],
         [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]])
     await edit_msg(cq, text, kb)
