@@ -114,6 +114,7 @@ DEFAULT_SETTINGS = {
     "karta": "",
     "karta_egasi": "",
     "admin_contact": "",
+    "texnik": False,
 }
 
 BTN_CONTINUE = "▶️ Davom ettirish"
@@ -134,6 +135,15 @@ MENU_TEXTS = {
 SUB_TEXT = ("❌ <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling.</b>\n\n"
             "Obuna bo'lgach «✅ Obunani tekshirish» tugmasini bosing.\n"
             "Yoki 💎 VIP oling va obunasiz foydalaning.")
+
+TEXNIK_TEXT = ("🛠 <b>Texnik ishlar</b>\n\n"
+               "Bot hozir yangilanmoqda. Iltimos, birozdan keyin urinib ko'ring.\n"
+               "Noqulaylik uchun uzr so'raymiz. 🙏")
+
+PURGE_TEXT = ("⚠️ <b>Diqqat!</b>\n\n"
+              "Siz majburiy obunadagi kanaldan chiqib ketganingiz sababli "
+              "chatdagi kinolar o'chirildi.\n\n"
+              "Qayta foydalanish uchun kanallarga obuna bo'ling yoki 💎 VIP oling.")
 
 EP_PER_PAGE = 30
 LIST_PER_PAGE = 10
@@ -311,6 +321,72 @@ def vip_status(uid):
         except Exception:
             pass
     return "❌ Yo'q"
+
+
+# ---------------- obunadan chiqqanda media tozalash ----------------
+
+def track_media_msg(uid, message_id):
+    """Foydalanuvchiga yuborilgan kino (media) xabarini eslab qoladi."""
+    u = db.users.get(str(uid))
+    if not u or not message_id:
+        return
+    ids = [int(x) for x in (u.get("media_msgs") or [])]
+    ids.append(int(message_id))
+    u["media_msgs"] = ids[-300:]
+    db.save()
+
+
+async def purge_user_media(bot, uid, notify=True):
+    """Obunadan chiqqan foydalanuvchi chatidan bot yuborgan kinolarni o'chiradi.
+    Matnlar va tugmalar tegilmaydi. VIP foydalanuvchilar ozod."""
+    if is_vip(uid):
+        return 0
+    u = db.users.get(str(uid))
+    if not u:
+        return 0
+    ids = [int(x) for x in (u.get("media_msgs") or [])]
+    if not ids:
+        return 0
+    deleted = 0
+    for mid in ids:
+        try:
+            await bot.delete_message(uid, mid)
+            deleted += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.04)
+    u["media_msgs"] = []
+    db.save()
+    if notify and deleted:
+        try:
+            await bot.send_message(uid, PURGE_TEXT)
+        except Exception:
+            pass
+    return deleted
+
+
+async def media_monitor():
+    """Har 10 daqiqada obunadan chiqqanlarni tekshirib, kinolarini o'chiradi."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            if db.channels:
+                for uid_str, u in list(db.users.items()):
+                    if not u.get("media_msgs"):
+                        continue
+                    try:
+                        uid = int(uid_str)
+                    except Exception:
+                        continue
+                    if is_vip(uid):
+                        continue
+                    ok, _bad = await check_subscription(bot, uid)
+                    if not ok:
+                        await purge_user_media(bot, uid)
+                    await asyncio.sleep(0.05)
+        except Exception:
+            pass
+        await asyncio.sleep(600)
 
 
 def rating_of(movie):
@@ -535,10 +611,10 @@ def admin_kb():
          InlineKeyboardButton(text="🛒 Buyurtmalar", callback_data="a:uorders")],
         [InlineKeyboardButton(text="⚠️ Shikoyatlar", callback_data="a:comp"),
          InlineKeyboardButton(text="📣 Kanallar", callback_data="a:chan")],
-        [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="a:users"),
-         InlineKeyboardButton(text="🚫 Ban/Unban", callback_data="a:ban")],
-        [InlineKeyboardButton(text="📈 Analitika", callback_data="a:anal"),
-         InlineKeyboardButton(text="📤 Eksport", callback_data="a:expe")],
+        [InlineKeyboardButton(text="🛠 Texnik ishlar", callback_data="a:texnik"),
+         InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="a:users")],
+        [InlineKeyboardButton(text="🚫 Ban/Unban", callback_data="a:ban"),
+         InlineKeyboardButton(text="📈 Analitika", callback_data="a:anal")],
         [InlineKeyboardButton(text="📥 Import", callback_data="a:expi"),
          InlineKeyboardButton(text="💎 Premium", callback_data="a:prem")],
         [InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="a:sett"),
@@ -814,15 +890,17 @@ async def deliver_episode(bot, chat_id, mv, season, episode):
     cap = f"{mv['name']} — {part_label(season, episode, multi)}"
     prot = bool(db.settings.get("himoya"))
     if isinstance(val, dict) and val.get("from_chat_id"):
-        await bot.copy_message(chat_id, val["from_chat_id"], val["message_id"],
-                               caption=cap, protect_content=prot)
+        sent = await bot.copy_message(chat_id, val["from_chat_id"], val["message_id"],
+                                      caption=cap, protect_content=prot)
     elif isinstance(val, dict):
         senders = {"document": bot.send_document, "photo": bot.send_photo,
                    "animation": bot.send_animation, "audio": bot.send_audio}
         sender = senders.get(val.get("type"), bot.send_video)
-        await sender(chat_id, val["file_id"], caption=cap, protect_content=prot)
+        sent = await sender(chat_id, val["file_id"], caption=cap, protect_content=prot)
     else:
-        await bot.send_video(chat_id, val, caption=cap, protect_content=prot)
+        sent = await bot.send_video(chat_id, val, caption=cap, protect_content=prot)
+    if int(chat_id) > 0:
+        track_media_msg(chat_id, getattr(sent, "message_id", None))
     return True
 
 
@@ -847,6 +925,14 @@ class GuardMiddleware(BaseMiddleware):
         if user.id in ADMIN_IDS:
             return await handler(event, data)
 
+        if db.settings.get("texnik"):
+            if isinstance(event, Message):
+                await event.answer(TEXNIK_TEXT)
+            else:
+                await event.answer("🛠 Botda texnik ishlar ketmoqda. Keyinroq urinib ko'ring.",
+                                   show_alert=True)
+            return
+
         db.user(user.id, user.full_name, user.username or "")
         u = db.users[str(user.id)]
         if u.get("banned") or user.id in db.banned:
@@ -867,6 +953,7 @@ class GuardMiddleware(BaseMiddleware):
             bot_ = data["bot"]
             ok, _bad = await check_subscription(bot_, user.id)
             if not ok:
+                await purge_user_media(bot_, user.id)
                 if isinstance(event, CallbackQuery):
                     await event.answer("⚠️ Avval kanallarga obuna bo'ling!", show_alert=True)
                     try:
@@ -1759,7 +1846,7 @@ async def a_tariff(cq: CallbackQuery, state: FSMContext):
 
 
 @router_admin.message(AddContent.seasons, F.text)
-async def a_seasons_count(m: Message, state: FSMContext, bot: Bot):
+async def a_seasons_count(m: Message, state: FSMContext):
     raw = m.text.strip()
     data = await state.get_data()
     total = 0
@@ -1783,7 +1870,6 @@ async def a_seasons_count(m: Message, state: FSMContext, bot: Bot):
     }
     db.save()
     await state.clear()
-    await auto_backup(bot, reason=f"Yangi kontent: {code}")
     await m.answer(f"✅ <b>{data.get('name', code)}</b> qo'shildi!\n\n"
                    f"Endi qismlarni qo'shing: Admin panel → ✂️ Qism qo'shish.",
                    reply_markup=admin_kb())
@@ -1884,11 +1970,10 @@ async def a_ep_media(m: Message, state: FSMContext, bot: Bot):
 
 
 @router_admin.message(AddEpisodes.batch, Command("done"))
-async def a_ep_done(m: Message, state: FSMContext, bot: Bot):
+async def a_ep_done(m: Message, state: FSMContext):
     data = await state.get_data()
     mv = db.movies.get(data.get("code", ""))
     await state.clear()
-    await auto_backup(bot, reason=f"Qismlar qo'shildi: {data.get('code', '')}")
     await m.answer(f"✅ Tayyor! Qo'shildi: {data.get('added', 0)} ta.\n"
                    f"Jami qismlar: {len(mv['parts']) if mv else 0}.",
                    reply_markup=admin_kb())
@@ -1943,7 +2028,6 @@ async def a_del_media(cq: CallbackQuery):
     code = cq.data.split(":", 1)[1]
     mv = db.movies.pop(code, None)
     db.save()
-    await auto_backup(cq.bot, reason=f"Kontent o'chirildi: {code}")
     await cq.answer(f"🗑 {mv['name'] if mv else code} o'chirildi.")
     await edit_msg(cq, "🗑 O'chirildi.", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Orqaga", callback_data="a:del")]]))
@@ -1989,7 +2073,6 @@ async def a_delseason(cq: CallbackQuery):
     for k in keys:
         mv["parts"].pop(k, None)
     db.save()
-    await auto_backup(cq.bot, reason=f"{code} {season}-fasl o'chirildi")
     await cq.answer(f"🗑 {season}-fasl o'chirildi ({len(keys)} qism).")
     await edit_msg(cq, f"🗑 {season}-fasl o'chirildi.", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Orqaga", callback_data="a:del")]]))
@@ -2052,7 +2135,6 @@ async def a_dele_episode(cq: CallbackQuery):
         return
     mv["parts"].pop(f"{season}:{episode}", None)
     db.save()
-    await auto_backup(cq.bot, reason=f"{code} {season}:{episode} qism o'chirildi")
     await cq.answer(f"🗑 {episode}-qism o'chirildi.")
     await edit_msg(cq, f"🗑 {season}-fasl {episode}-qism o'chirildi.",
                    InlineKeyboardMarkup(inline_keyboard=[
@@ -2294,7 +2376,6 @@ async def a_approve(cq: CallbackQuery, bot: Bot):
     r["handled_by"] = cq.from_user.id
     r["handled_at"] = now_iso()
     db.save()
-    await auto_backup(bot, reason=f"To'lov #{rid} tasdiqlandi")
     try:
         await bot.send_message(uid, f"🎉 Tabriklaymiz! <b>{label}</b> premium obunangiz faollashtirildi. 🎬",
                                reply_markup=main_kb(uid))
@@ -2471,6 +2552,27 @@ async def a_comp_clr(cq: CallbackQuery):
     await cq.answer("🗑 Tozalandi.")
 
 
+# ---- texnik ishlar ----
+
+@router_admin.callback_query(F.data == "a:texnik")
+async def a_texnik(cq: CallbackQuery):
+    db.settings["texnik"] = not bool(db.settings.get("texnik", False))
+    db.save()
+    on = bool(db.settings["texnik"])
+    text = ("🛠 <b>Texnik ishlar rejimi</b>\n\n"
+            f"Holat: {'🔴 YOQILGAN' if on else '🟢 O'CHIRILGAN'}\n\n"
+            + ("Foydalanuvchilar botga yozganda «texnik ishlar ketmoqda» deb javob oladi. "
+               "Adminlar va owner botdan normal foydalanadi."
+               if on else
+               "Bot yana barcha foydalanuvchilar uchun ishlaydi."))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔴 O'chirish" if on else "🟢 Yoqish",
+                              callback_data="a:texnik")],
+        [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]])
+    await edit_msg(cq, text, kb)
+    await cq.answer("🛠 Texnik ishlar yoqildi." if on else "✅ Texnik ishlar o'chirildi.")
+
+
 # ---- analitika ----
 
 @router_admin.callback_query(F.data == "a:anal")
@@ -2628,9 +2730,11 @@ async def a_backup_menu(cq: CallbackQuery):
         [InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="a:restore")],
         [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]])
     text = ("💾 <b>Zaxira nuska</b>\n\n"
-            "• <b>Zaxira olish</b> — barcha ma'lumot JSON bo'lib zaxira kanalga yuboriladi.\n"
-            "• <b>Tiklash</b> — JSON yoki ZIP yuborib, /done yozasiz — ma'lumot aynan "
-            "zaxiradagidek tiklanadi.")
+            "• <b>Zaxira olish</b> — bot <b>bitta JSON</b> fayl yasab zaxira kanalga yuboradi: "
+            "foydalanuvchilar (VIP holati, hisobidagi pul), barcha kinolar (kodi, posteri, "
+            "qismlari va boshqa ma'lumotlari) shu faylda bo'ladi.\n"
+            "• <b>Tiklash</b> — JSON yoki ZIP yuborib, /done yozasiz — zaxiradagi kontentlar "
+            "qo'shiladi/yangilanadi, mavjudlari saqlanib qoladi.")
     await edit_msg(cq, text, kb)
     await cq.answer()
 
@@ -2732,21 +2836,6 @@ def _merge_backup_objects(base, incoming):
     return base
 
 
-async def auto_backup(bot, reason=""):
-    if not BACKUP_CHANNEL_ID:
-        return
-    try:
-        payload = json.dumps(db.to_dict(), ensure_ascii=False, indent=1).encode("utf-8")
-        fname = f"avtozahira_{datetime.now():%Y%m%d_%H%M%S}.json"
-        caption = "🤖 Bot avtomatik zaxirasi"
-        if reason:
-            caption += f"\n📝 Sabab: {reason}"
-        await bot.send_document(BACKUP_CHANNEL_ID, BufferedInputFile(payload, filename=fname),
-                                caption=caption)
-    except Exception:
-        pass
-
-
 @router_admin.callback_query(F.data == "a:restore")
 async def a_restore_start(cq: CallbackQuery, state: FSMContext):
     await state.set_state(RestoreFlow.file)
@@ -2761,7 +2850,7 @@ async def a_restore_start(cq: CallbackQuery, state: FSMContext):
 
 
 @router_admin.message(RestoreFlow.file, Command("done"))
-async def a_restore_done(m: Message, state: FSMContext, bot: Bot):
+async def a_restore_done(m: Message, state: FSMContext):
     data = await state.get_data()
     restored = data.get("restore_data")
     count = int(data.get("restore_files", 0) or 0)
@@ -2776,7 +2865,6 @@ async def a_restore_done(m: Message, state: FSMContext, bot: Bot):
         db._rid = max(db._rid, max(numeric_rids))
     db.save()
     await state.clear()
-    await auto_backup(bot, reason=f"Zaxiradan tiklash ({count} ta fayl)")
     await m.answer(f"✅ Tiklandi. {count} ta fayl birlashtirildi.\n"
                    f"🎬 Kontentlar: {before_movies} → {len(db.movies)}\n"
                    f"👥 Foydalanuvchilar: {len(db.users)}\n"
@@ -2898,6 +2986,7 @@ dp.include_router(router_user)
 async def main():
     print("[5/7] Local ma'lumot yuklanmoqda...", flush=True)
     db.load_local()
+    asyncio.create_task(media_monitor())
     if BACKUP_CHANNEL_ID and not db.movies and not db.users:
         print("[!] Ma'lumot bo'sh — adminlarga zaxira eslatmasi yuboriladi.", flush=True)
         for admin_id in ADMIN_IDS:
