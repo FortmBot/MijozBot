@@ -1431,9 +1431,15 @@ async def search_name_run(m: Message, state: FSMContext):
 
 @router_user.message(SearchCode.q, F.text)
 async def search_code_run(m: Message, state: FSMContext):
-    q = m.text.strip()
+    q = m.text.strip().lstrip("#")
     await state.clear()
     mv = db.movies.get(q)
+    if not mv:
+        ql = q.casefold()
+        for code, item in db.movies.items():
+            if code.casefold() == ql:
+                mv = item
+                break
     if not mv:
         return await m.answer("❌ Bunday kodli kino topilmadi.", reply_markup=main_kb(m.from_user.id))
     await send_card(m.bot, m.chat.id, mv["code"], m.from_user.id, inc=True)
@@ -1784,7 +1790,7 @@ async def a_tariff(cq: CallbackQuery, state: FSMContext):
 
 
 @router_admin.message(AddContent.seasons, F.text)
-async def a_seasons_count(m: Message, state: FSMContext):
+async def a_seasons_count(m: Message, state: FSMContext, bot: Bot):
     raw = m.text.strip()
     data = await state.get_data()
     total = 0
@@ -1808,6 +1814,7 @@ async def a_seasons_count(m: Message, state: FSMContext):
     }
     db.save()
     await state.clear()
+    await auto_backup(bot, reason=f"Yangi kontent: {code}")
     await m.answer(f"✅ <b>{data.get('name', code)}</b> qo'shildi!\n\n"
                    f"Endi qismlarni qo'shing: Admin panel → ✂️ Qism qo'shish.",
                    reply_markup=admin_kb())
@@ -1908,10 +1915,11 @@ async def a_ep_media(m: Message, state: FSMContext, bot: Bot):
 
 
 @router_admin.message(AddEpisodes.batch, Command("done"))
-async def a_ep_done(m: Message, state: FSMContext):
+async def a_ep_done(m: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     mv = db.movies.get(data.get("code", ""))
     await state.clear()
+    await auto_backup(bot, reason=f"Qismlar qo'shildi: {data.get('code', '')}")
     await m.answer(f"✅ Tayyor! Qo'shildi: {data.get('added', 0)} ta.\n"
                    f"Jami qismlar: {len(mv['parts']) if mv else 0}.",
                    reply_markup=admin_kb())
@@ -1966,6 +1974,7 @@ async def a_del_media(cq: CallbackQuery):
     code = cq.data.split(":", 1)[1]
     mv = db.movies.pop(code, None)
     db.save()
+    await auto_backup(cq.bot, reason=f"Kontent o'chirildi: {code}")
     await cq.answer(f"🗑 {mv['name'] if mv else code} o'chirildi.")
     await edit_msg(cq, "🗑 O'chirildi.", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Orqaga", callback_data="a:del")]]))
@@ -2011,6 +2020,7 @@ async def a_delseason(cq: CallbackQuery):
     for k in keys:
         mv["parts"].pop(k, None)
     db.save()
+    await auto_backup(cq.bot, reason=f"{code} {season}-fasl o'chirildi")
     await cq.answer(f"🗑 {season}-fasl o'chirildi ({len(keys)} qism).")
     await edit_msg(cq, f"🗑 {season}-fasl o'chirildi.", InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="« Orqaga", callback_data="a:del")]]))
@@ -2073,6 +2083,7 @@ async def a_dele_episode(cq: CallbackQuery):
         return
     mv["parts"].pop(f"{season}:{episode}", None)
     db.save()
+    await auto_backup(cq.bot, reason=f"{code} {season}:{episode} qism o'chirildi")
     await cq.answer(f"🗑 {episode}-qism o'chirildi.")
     await edit_msg(cq, f"🗑 {season}-fasl {episode}-qism o'chirildi.",
                    InlineKeyboardMarkup(inline_keyboard=[
@@ -2314,6 +2325,7 @@ async def a_approve(cq: CallbackQuery, bot: Bot):
     r["handled_by"] = cq.from_user.id
     r["handled_at"] = now_iso()
     db.save()
+    await auto_backup(bot, reason=f"To'lov #{rid} tasdiqlandi")
     try:
         await bot.send_message(uid, f"🎉 Tabriklaymiz! <b>{label}</b> premium obunangiz faollashtirildi. 🎬",
                                reply_markup=main_kb(uid))
@@ -2770,6 +2782,21 @@ def _merge_backup_objects(base, incoming):
     return base
 
 
+async def auto_backup(bot, reason=""):
+    if not BACKUP_CHANNEL_ID:
+        return
+    try:
+        payload = json.dumps(db.to_dict(), ensure_ascii=False, indent=1).encode("utf-8")
+        fname = f"avtozahira_{datetime.now():%Y%m%d_%H%M%S}.json"
+        caption = "🤖 Bot avtomatik zaxirasi"
+        if reason:
+            caption += f"\n📝 Sabab: {reason}"
+        await bot.send_document(BACKUP_CHANNEL_ID, BufferedInputFile(payload, filename=fname),
+                                caption=caption)
+    except Exception:
+        pass
+
+
 @router_admin.callback_query(F.data == "a:restore")
 async def a_restore_start(cq: CallbackQuery, state: FSMContext):
     await state.set_state(RestoreFlow.file)
@@ -2777,30 +2804,32 @@ async def a_restore_start(cq: CallbackQuery, state: FSMContext):
     await edit_msg(cq, "♻️ <b>Zaxirani tiklash</b>\n\n"
                        "Bitta JSON yoki ichida JSON bo'lgan ZIP arxiv yuboring.\n"
                        "Bir nechta faylni ketma-ket yuborib, oxirida /done yozing.\n"
+                       "Tiklash mavjud ma'lumotni o'chirmaydi: zaxiradagi kontentlar "
+                       "qo'shiladi/yangilanadi, qolganlari saqlanib qoladi.\n"
                        "Bekor qilish: /bekor")
     await cq.answer()
 
 
 @router_admin.message(RestoreFlow.file, Command("done"))
-async def a_restore_done(m: Message, state: FSMContext):
+async def a_restore_done(m: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     restored = data.get("restore_data")
     count = int(data.get("restore_files", 0) or 0)
     if not restored or not count:
         await m.answer("❌ Hali JSON yuborilmadi. JSON/ZIP yuboring yoki /bekor.")
         return
-    base = blank_data()
-    for key, value in restored.items():
-        base[key] = value
-    for key, value in blank_data().items():
-        base.setdefault(key, value)
-    base["settings"] = {**DEFAULT_SETTINGS, **(base.get("settings") or {})}
-    db.load_dict(base)
+    before_movies = len(db.movies)
+    merged = _merge_backup_objects(db.to_dict(), restored)
+    db.load_dict(merged)
+    numeric_rids = [int(rid) for rid in db.receipts.keys() if str(rid).isdigit()]
+    if numeric_rids:
+        db._rid = max(db._rid, max(numeric_rids))
     db.save()
     await state.clear()
+    await auto_backup(bot, reason=f"Zaxiradan tiklash ({count} ta fayl)")
     await m.answer(f"✅ Tiklandi. {count} ta fayl birlashtirildi.\n"
+                   f"🎬 Kontentlar: {before_movies} → {len(db.movies)}\n"
                    f"👥 Foydalanuvchilar: {len(db.users)}\n"
-                   f"🎬 Kontentlar: {len(db.movies)}\n"
                    f"📁 Qismlar: {sum(len(mv['parts']) for mv in db.movies.values())}",
                    reply_markup=admin_kb())
 
@@ -2919,6 +2948,19 @@ dp.include_router(router_user)
 async def main():
     print("[5/7] Local ma'lumot yuklanmoqda...", flush=True)
     db.load_local()
+    if BACKUP_CHANNEL_ID and not db.movies and not db.users:
+        print("[!] Ma'lumot bo'sh — adminlarga zaxira eslatmasi yuboriladi.", flush=True)
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    "⚠️ <b>Bot ma'lumoti topilmadi.</b>\n"
+                    "Render qayta ishga tushgan bo'lishi mumkin.\n\n"
+                    "Tiklash: zaxira kanalidagi eng yangi JSON faylni shu yerga "
+                    "forward qiling → /done yozing.\n"
+                    "(Admin panel → 💾 Zaxira → ♻️ Zaxirani tiklash)")
+            except Exception:
+                pass
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except TelegramUnauthorizedError:
