@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import traceback
+import unicodedata
 import zipfile
 from datetime import datetime, timedelta
 from html import escape as he
@@ -319,36 +320,124 @@ def rating_of(movie):
     return f"{sum(r.values()) / len(r):.1f}", len(r)
 
 
+_EP_KEYWORDS = (
+    r"qism|qismi|episode|epizod|seriya|seria|part|серия|часть",
+    r"bolum|bolumu|bolim|bolimi|chapter",
+)
+_NUM_WORDS = {
+    "nol": 0, "bir": 1, "ikki": 2, "uch": 3, "tort": 4, "besh": 5, "olti": 6,
+    "yetti": 7, "sakkiz": 8, "toqqiz": 9, "on": 10, "yigirma": 20, "ottiz": 30,
+    "qirq": 40, "ellik": 50, "oltmish": 60, "yetmish": 70, "sakson": 80,
+    "toqson": 90, "yuz": 100,
+    # turkcha
+    "iki": 2, "uc": 3, "dort": 4, "bes": 5, "alti": 6, "yedi": 7, "dokuz": 9,
+    "yirmi": 20, "otuz": 30, "kirk": 40, "elli": 50, "altmis": 60,
+    "yetmis": 70, "seksen": 80, "doksan": 90,
+}
+_ORD_WORDS = {
+    "birinchi": 1, "ikkinchi": 2, "uchinchi": 3, "tortinchi": 4, "beshinchi": 5,
+    "oltinchi": 6, "yettinchi": 7, "sakkizinchi": 8, "toqqizinchi": 9,
+    "oninchi": 10, "yigirmanchi": 20, "ottizinchi": 30, "qirqinchi": 40,
+    "elliginchi": 50, "oltmishinchi": 60, "yetmishinchi": 70,
+    "saksoninchi": 80, "toqsoninchi": 90, "yuzinchi": 100,
+    "birinci": 1, "ikinci": 2, "ucuncu": 3, "dorduncu": 4, "besinci": 5,
+    "altinci": 6, "yedinci": 7, "sekizinci": 8, "dokuzuncu": 9, "onuncu": 10,
+}
+_TRANS = {
+    ord("ö"): "o", ord("ü"): "u", ord("ş"): "s", ord("ç"): "c", ord("ğ"): "g",
+    ord("ı"): "i", ord("ə"): "e", ord("’"): "", ord("‘"): "", ord("`"): "",
+    ord("'"): "", ord("ʻ"): "", ord("ʼ"): "",
+    ord(chr(0x307)): "", ord("–"): "-", ord("—"): "-", ord("−"): "-", ord("‐"): "-", ord("‑"): "-",
+}
+for _digits in ("٠١٢٣٤٥٦٧٨٩", "۰۱۲۳۴۵۶۷۸۹"):
+    for _idx, _ch in enumerate(_digits):
+        _TRANS[ord(_ch)] = str(_idx)
+
+
+def _norm_caption(value):
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(text.casefold().translate(_TRANS).split())
+
+
+def _num_words_sum(tokens):
+    total, found = 0, False
+    for token in tokens:
+        value = _NUM_WORDS.get(token, _ORD_WORDS.get(token))
+        if value is None:
+            return None
+        found = True
+        if value == 100:
+            total = (total or 1) * 100
+        else:
+            total += value
+    return total if found else None
+
+
+def _words_phrase_number(phrase):
+    tokens = [t for t in phrase.split() if t]
+    for start in range(len(tokens)):
+        value = _num_words_sum(tokens[start:])
+        if value:
+            return value
+    return None
+
+
+def _detect_part_number(text):
+    """Qism raqamini turli yozuvlarda topadi: '5-qism', '5. BÖLÜM', 'Qism: 5', 'beshinchi qism'."""
+    norm = _norm_caption(text)
+    if not norm:
+        return None
+    for keywords in _EP_KEYWORDS:
+        for pattern in (r"(\d{1,4})\s*[.\-–—_:#№)\]]*\s*(?:%s)" % keywords,
+                        r"(?:%s)\s*[.\-–—_:#№]*\s*(\d{1,4})" % keywords):
+            m = re.search(pattern, norm)
+            if m and int(m.group(1)) > 0:
+                return int(m.group(1))
+        for pattern in (r"([a-z]+(?:\s+[a-z]+){0,3})\s*(?:%s)" % keywords,
+                        r"(?:%s)\s*([a-z]+(?:\s+[a-z]+){0,3})" % keywords):
+            m = re.search(pattern, norm)
+            if m:
+                value = _words_phrase_number(m.group(1))
+                if value:
+                    return value
+    m = re.search(r"\bs\s*(\d{1,2})\s*[._ -]?\s*e\s*(\d{1,4})\b", norm)
+    if m:
+        return int(m.group(2))
+    m = re.search(r"\b(\d{1,2})\s*[xх]\s*(\d{1,4})\b", norm)
+    if m:
+        return int(m.group(2))
+    cleaned = re.sub(r"\d+\s*[.\-]?\s*(?:fasl|mavsum|season|sezon|saison|сезон)", " ", norm)
+    cleaned = re.sub(r"\b(?:19|20)\d{2}\b", " ", cleaned)
+    cleaned = re.sub(r"\b\d{3,4}\s*p\b", " ", cleaned)
+    m = re.search(r"\b(\d{1,3})\b", cleaned)
+    return int(m.group(1)) if m and int(m.group(1)) > 0 else None
+
+
+def _detect_season_number(text):
+    norm = _norm_caption(text)
+    if not norm:
+        return None
+    m = re.search(r"(\d{1,2})\s*[.\-–—_]*\s*(?:fasl|mavsum|season|sezon|saison|сезон)", norm)
+    if m and int(m.group(1)) > 0:
+        return int(m.group(1))
+    m = re.search(r"\bs\s*(\d{1,2})\s*[._ -]?\s*e\s*\d{1,4}\b", norm)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\b(\d{1,2})\s*[xх]\s*\d{1,4}\b", norm)
+    if m and int(m.group(1)) > 0:
+        return int(m.group(1))
+    return None
+
+
 def parse_part(caption):
     """Sarlavhadan (fasl, qism) o'qiydi.
-    '5-qism' -> (1, 5); '3 fasl 5 qism' -> (3, 5); 's3e5' -> (3, 5); '3x5' -> (3, 5)."""
+    '5-qism', '5. BÖLÜM', 'Qism: 5', 'beshinchi qism', '3 fasl 5 qism', 's3e5', '3x5'."""
     if not caption:
         return None
-    c = caption.lower().replace("сезон", "fasl").replace("серия", "qism")
-    season, episode = None, None
-    m = re.search(r"(\d+)\s*[-.]?\s*fasl", c)
-    if m:
-        season = int(m.group(1))
-    m = re.search(r"(\d+)\s*[-.]?\s*qism", c)
-    if m:
-        episode = int(m.group(1))
-    if season is None and episode is None:
-        m = re.search(r"s(\d+)[^0-9]*e(\d+)", c)
-        if m:
-            season, episode = int(m.group(1)), int(m.group(2))
-    if season is None and episode is None:
-        m = re.search(r"(\d+)\s*[xх]\s*(\d+)", c)
-        if m:
-            season, episode = int(m.group(1)), int(m.group(2))
-    if episode is None:
-        m = re.search(r"(\d+)", c)
-        if m:
-            episode = int(m.group(1))
-    if episode is None:
+    episode = _detect_part_number(caption)
+    if not episode:
         return None
-    if season is None:
-        season = 1
-    return season, episode
+    return (_detect_season_number(caption) or 1), episode
 
 
 def part_label(season, episode, multi_season):
@@ -728,10 +817,10 @@ async def deliver_episode(bot, chat_id, mv, season, episode):
         await bot.copy_message(chat_id, val["from_chat_id"], val["message_id"],
                                caption=cap, protect_content=prot)
     elif isinstance(val, dict):
-        if val.get("type") == "document":
-            await bot.send_document(chat_id, val["file_id"], caption=cap, protect_content=prot)
-        else:
-            await bot.send_video(chat_id, val["file_id"], caption=cap, protect_content=prot)
+        senders = {"document": bot.send_document, "photo": bot.send_photo,
+                   "animation": bot.send_animation, "audio": bot.send_audio}
+        sender = senders.get(val.get("type"), bot.send_video)
+        await sender(chat_id, val["file_id"], caption=cap, protect_content=prot)
     else:
         await bot.send_video(chat_id, val, caption=cap, protect_content=prot)
     return True
@@ -1760,12 +1849,13 @@ async def a_ep_season(m: Message, state: FSMContext):
     await m.answer(
         f"📤 <b>{mv['name'] if mv else ''}</b> — {s_text}.\n\n"
         "Videolarni yuboring. Qism raqami sarlavhada bo'lsin:\n"
-        "• <b>5-qism</b> → 5-qism\n"
+        "• <b>5-qism</b>, <b>5. BÖLÜM</b>, <b>Qism: 5</b>, <b>beshinchi qism</b>\n"
         "• <b>3 fasl 5 qism</b>, <b>s3e5</b>, <b>3x5</b>\n\n"
         "Tugatgach /done yozing. Bekor qilish: /bekor")
 
 
-@router_admin.message(AddEpisodes.batch, F.video | F.document)
+@router_admin.message(AddEpisodes.batch,
+                      F.video | F.document | F.photo | F.animation | F.audio)
 async def a_ep_media(m: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     code = data.get("code", "")
@@ -1775,8 +1865,11 @@ async def a_ep_media(m: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return await m.answer("❌ Kino topilmadi.", reply_markup=admin_kb())
     parsed = parse_part(m.caption)
-    fid = m.video.file_id if m.video else m.document.file_id
-    mtype = "video" if m.video else "document"
+    mtype = ("video" if m.video else "document" if m.document else "photo" if m.photo
+             else "animation" if m.animation else "audio")
+    fid = (m.photo[-1].file_id if m.photo else
+           m.video.file_id if m.video else m.document.file_id if m.document
+           else m.animation.file_id if m.animation else m.audio.file_id)
     if parsed:
         season, episode = parsed
         if fixed_season > 0:
@@ -1784,10 +1877,19 @@ async def a_ep_media(m: Message, state: FSMContext, bot: Bot):
     else:
         if fixed_season <= 0:
             return await m.answer("❌ Sarlavhada qism raqami topilmadi.\n"
-                                  "Masalan: <b>5-qism</b> yoki <b>3 fasl 5 qism</b>")
+                                  "Masalan: <b>5-qism</b>, <b>5. BÖLÜM</b>, <b>3 fasl 5 qism</b>")
         season = fixed_season
         existing = episodes_of(mv, season)
         episode = (max(existing) + 1) if existing else 1
+    note = ""
+    if f"{season}:{episode}" in mv.get("parts", {}):
+        current = mv["parts"][f"{season}:{episode}"]
+        if fid and isinstance(current, dict) and current.get("file_id") == fid:
+            return await m.answer(f"⚠️ Bu media allaqachon {episode}-qism sifatida qo'shilgan.")
+        taken = episode
+        existing = episodes_of(mv, season)
+        episode = (max(existing) + 1) if existing else episode + 1
+        note = f"\nℹ️ {taken}-qism band edi — {episode}-qism sifatida saqlandi."
     mv.setdefault("parts", {})[f"{season}:{episode}"] = {"file_id": fid, "type": mtype}
     total_seasons = max(seasons_of(mv) or [0])
     if int(mv.get("season_total", 0) or 0) < total_seasons:
@@ -1795,7 +1897,7 @@ async def a_ep_media(m: Message, state: FSMContext, bot: Bot):
     db.save()
     await state.update_data(added=int(data.get("added", 0)) + 1)
     label = part_label(season, episode, len(seasons_of(mv)) > 1)
-    await m.answer(f"✅ {label} qo'shildi (jami: {len(mv['parts'])}).\n"
+    await m.answer(f"✅ {label} qo'shildi (jami: {len(mv['parts'])}).{note}\n"
                    "Davom eting yoki /done yozing.")
     for suid in mv.get("subs", []):
         try:
@@ -1813,6 +1915,13 @@ async def a_ep_done(m: Message, state: FSMContext):
     await m.answer(f"✅ Tayyor! Qo'shildi: {data.get('added', 0)} ta.\n"
                    f"Jami qismlar: {len(mv['parts']) if mv else 0}.",
                    reply_markup=admin_kb())
+
+
+@router_admin.message(AddEpisodes.batch, F.text)
+async def a_ep_text_hint(m: Message, state: FSMContext):
+    await m.answer("📤 Qism sifatida video, rasm, GIF yoki fayl yuboring.\n"
+                   "Qism raqami sarlavhada bo'lsin: <b>5-qism</b>, <b>5. BÖLÜM</b>.\n\n"
+                   "Tugatish: /done · Bekor qilish: /bekor")
 
 
 # ---- o'chirish ----
