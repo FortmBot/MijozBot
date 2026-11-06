@@ -1485,22 +1485,8 @@ async def cb_complaint_send(cq: CallbackQuery, state: FSMContext, bot: Bot):
     db.complaints.append({"cid": cid, "uid": cq.from_user.id, "text": text,
                           "at": now_iso(), "status": "wait"})
     db.save()
-    admin_text = (f"📝 <b>Yangi shikoyat</b> #{cid}\n\n"
-                  f"👤 {he(cq.from_user.full_name)}\n"
-                  f"🆔 <code>{cq.from_user.id}</code>\n"
-                  f"🔗 {he(user_link(cq.from_user))}\n"
-                  f"🕒 {now_iso()}\n\n"
-                  f"💬 {he(text)}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"cmp_ok:{cid}"),
-         InlineKeyboardButton(text="❌ Rad etish", callback_data=f"cmp_rej:{cid}")]])
-    for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(aid, admin_text, reply_markup=kb)
-        except Exception:
-            pass
     await state.clear()
-    await edit_msg(cq, f"✅ Shikoyatingiz adminga yuborildi (#{cid}).\nJavobini kuting.")
+    await edit_msg(cq, f"✅ Shikoyatingiz qabul qilindi (#{cid}).\nJavobini kuting.")
     await cq.answer("✅ Yuborildi.")
 
 
@@ -1602,25 +1588,8 @@ async def order_year(m: Message, state: FSMContext, bot: Bot):
     db.orders.append({"oid": oid, "uid": m.from_user.id, "name": name, "year": year,
                       "photo": photo, "at": now_iso(), "status": "new"})
     db.save()
-    caption = (f"🛒 <b>Yangi buyurtma</b> #{oid}\n"
-               f"🎬 {he(name)}\n"
-               + (f"📅 {he(year)}\n" if year else "📅 —\n")
-               + f"👤 {he(m.from_user.full_name)}\n"
-               + f"🆔 <code>{m.from_user.id}</code>\n"
-               + f"🔗 {he(user_link(m.from_user))}\n"
-               + f"🕒 {now_iso()}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ko'rildi", callback_data=f"ord_ok:{oid}")]])
-    for aid in ADMIN_IDS:
-        try:
-            if photo:
-                await bot.send_photo(aid, photo, caption=caption, reply_markup=kb)
-            else:
-                await bot.send_message(aid, caption, reply_markup=kb)
-        except Exception:
-            pass
     await state.clear()
-    await m.answer("✅ Buyurtmangiz adminlarga yuborildi. Tez orada javob beramiz.",
+    await m.answer("✅ Buyurtmangiz qabul qilindi. Tez orada javob beramiz.",
                    reply_markup=main_kb(m.from_user.id))
 
 
@@ -2377,45 +2346,43 @@ async def a_reject(cq: CallbackQuery, bot: Bot):
 
 # ---- foydalanuvchi buyurtmalari ----
 
+async def _show_uorders(cq: CallbackQuery):
+    items = [o for o in db.orders if o.get("status") == "new"]
+    if not items:
+        await edit_msg(cq, "🛒 <b>Foydalanuvchi buyurtmalari</b>\n\nYangi buyurtmalar yo'q.",
+                       InlineKeyboardMarkup(inline_keyboard=[
+                           [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+        return
+    blocks = []
+    rows = []
+    for o in reversed(items[-15:]):
+        blocks.append(f"#{o.get('oid')} 🎬 {he(str(o.get('name')))}"
+                      + (f" ({he(str(o.get('year')))})" if o.get("year") else "")
+                      + f"\n👤 <code>{o.get('uid')}</code> • {str(o.get('at', ''))[:16]}")
+        rows.append([InlineKeyboardButton(text=f"#{o['oid']} ✅ Ko'rildi",
+                                          callback_data=f"ord_ok:{o['oid']}")])
+    rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
+    await edit_msg(cq, f"🛒 <b>Yangi buyurtmalar: {len(items)}</b>\n\n" + "\n\n".join(blocks),
+                   InlineKeyboardMarkup(inline_keyboard=rows))
+
+
 @router_admin.callback_query(F.data == "a:uorders")
 async def a_uorders(cq: CallbackQuery):
-    items = db.orders[-15:]
-    if not items:
-        await cq.answer("🛒 Buyurtmalar yo'q.", show_alert=True)
-        return
-    lines = []
-    for o in reversed(items):
-        lines.append(f"#{o.get('oid')} 🎬 {he(str(o.get('name')))}"
-                     + (f" ({he(str(o.get('year')))})" if o.get("year") else "")
-                     + f"\n👤 <code>{o.get('uid')}</code> • {str(o.get('at', ''))[:16]}")
-    await edit_msg(cq, "🛒 <b>Foydalanuvchi buyurtmalari</b>\n\n" + "\n\n".join(lines),
-                   InlineKeyboardMarkup(inline_keyboard=[
-                       [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
+    await _show_uorders(cq)
     await cq.answer()
 
 
 @router_admin.callback_query(F.data.startswith("ord_ok:"))
-async def a_order_seen(cq: CallbackQuery, bot: Bot):
+async def a_order_seen(cq: CallbackQuery):
     oid = int(cq.data.split(":")[1])
     rec = next((o for o in db.orders if o.get("oid") == oid), None)
     if not rec:
         await cq.answer("Topilmadi.")
         return
-    rec["status"] = "seen"
-    rec["handled_by"] = cq.from_user.id
+    db.orders = [o for o in db.orders if o.get("oid") != oid]
     db.save()
-    base = _admin_msg_base(cq.message)
-    try:
-        if cq.message.photo:
-            await cq.message.edit_caption(caption=base + f"\n\n✅ Ko'rildi\n👮 Admin: {admin_label(cq.from_user)}")
-        else:
-            await cq.message.edit_text(base + f"\n\n✅ Ko'rildi\n👮 Admin: {admin_label(cq.from_user)}")
-    except TelegramBadRequest:
-        pass
-    await notify_admins(bot, f"🛒 Buyurtma #{oid} ko'rildi.\n"
-                             f"👮 Admin: {admin_label(cq.from_user)}",
-                        exclude=cq.from_user.id)
-    await cq.answer("✅")
+    await cq.answer(f"✅ #{oid} o'chirildi.")
+    await _show_uorders(cq)
 
 
 # ---- shikoyatlar (admin) ----
@@ -2429,31 +2396,32 @@ CMP_REJECT_TEXT = ("Assalomu alaykum!\n\n"
                    "Hurmat bilan. 🙏")
 
 
-@router_admin.callback_query(F.data == "a:comp")
-async def a_comp(cq: CallbackQuery):
-    items = db.complaints[-10:]
+async def _show_comp(cq: CallbackQuery):
+    items = [c for c in db.complaints if c.get("status") == "wait"]
     if not items:
-        await edit_msg(cq, "⚠️ <b>Shikoyatlar</b>\n\nShikoyatlar yo'q.",
+        await edit_msg(cq, "⚠️ <b>Shikoyatlar</b>\n\nKutilayotgan shikoyatlar yo'q.",
                        InlineKeyboardMarkup(inline_keyboard=[
                            [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]]))
-        await cq.answer()
         return
-    st_map = {"wait": "⏳ kutilmoqda", "ok": "✅ tasdiqlangan", "rej": "❌ rad etilgan"}
     blocks = []
     rows = []
-    for c in reversed(items):
-        blocks.append(f"#{c.get('cid')} {st_map.get(c.get('status'), '')}\n"
+    for c in reversed(items[-10:]):
+        blocks.append(f"#{c.get('cid')}\n"
                       f"👤 <code>{c.get('uid')}</code> • {str(c.get('at', ''))[:16]}\n"
                       f"💬 {he(str(c.get('text', '')))[:300]}")
-        if c.get("status") == "wait":
-            rows.append([InlineKeyboardButton(text=f"#{c['cid']} ✅ Tasdiqlash",
-                                              callback_data=f"cmp_ok:{c['cid']}"),
-                         InlineKeyboardButton(text=f"#{c['cid']} ❌ Rad etish",
-                                              callback_data=f"cmp_rej:{c['cid']}")])
-    rows.append([InlineKeyboardButton(text="🗑 Tozalash", callback_data="comp:clr")])
+        rows.append([InlineKeyboardButton(text=f"#{c['cid']} ✅ Tasdiqlash",
+                                          callback_data=f"cmp_ok:{c['cid']}"),
+                     InlineKeyboardButton(text=f"#{c['cid']} ❌ Rad etish",
+                                          callback_data=f"cmp_rej:{c['cid']}")])
+    rows.append([InlineKeyboardButton(text="🗑 Hammasini tozalash", callback_data="comp:clr")])
     rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
-    text = "⚠️ <b>Shikoyatlar</b>\n\n" + "\n\n".join(blocks)
+    text = f"⚠️ <b>Kutilayotgan shikoyatlar: {len(items)}</b>\n\n" + "\n\n".join(blocks)
     await edit_msg(cq, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router_admin.callback_query(F.data == "a:comp")
+async def a_comp(cq: CallbackQuery):
+    await _show_comp(cq)
     await cq.answer()
 
 
@@ -2464,24 +2432,15 @@ async def a_cmp_ok(cq: CallbackQuery, bot: Bot):
     if not rec or rec.get("status") != "wait":
         await cq.answer("Allaqachon ko'rilgan.")
         return
-    rec["status"] = "ok"
-    rec["handled_by"] = cq.from_user.id
-    rec["handled_at"] = now_iso()
+    uid = rec["uid"]
+    db.complaints = [c for c in db.complaints if c.get("cid") != cid]
     db.save()
     try:
-        await bot.send_message(rec["uid"], CMP_APPROVE_TEXT, reply_markup=main_kb(rec["uid"]))
+        await bot.send_message(uid, CMP_APPROVE_TEXT, reply_markup=main_kb(uid))
     except Exception:
         pass
-    base = _admin_msg_base(cq.message)
-    try:
-        await cq.message.edit_text(base + f"\n\n✅ Tasdiqlandi\n👮 Admin: {admin_label(cq.from_user)}")
-    except TelegramBadRequest:
-        pass
-    await notify_admins(bot, f"📝 Shikoyat #{cid} tasdiqlandi.\n"
-                             f"👤 <code>{rec['uid']}</code>\n"
-                             f"👮 Admin: {admin_label(cq.from_user)}",
-                        exclude=cq.from_user.id)
-    await cq.answer("✅ Tasdiqlandi.")
+    await cq.answer(f"✅ #{cid} tasdiqlandi va o'chirildi.")
+    await _show_comp(cq)
 
 
 @router_admin.callback_query(F.data.startswith("cmp_rej:"))
@@ -2491,24 +2450,15 @@ async def a_cmp_rej(cq: CallbackQuery, bot: Bot):
     if not rec or rec.get("status") != "wait":
         await cq.answer("Allaqachon ko'rilgan.")
         return
-    rec["status"] = "rej"
-    rec["handled_by"] = cq.from_user.id
-    rec["handled_at"] = now_iso()
+    uid = rec["uid"]
+    db.complaints = [c for c in db.complaints if c.get("cid") != cid]
     db.save()
     try:
-        await bot.send_message(rec["uid"], CMP_REJECT_TEXT, reply_markup=main_kb(rec["uid"]))
+        await bot.send_message(uid, CMP_REJECT_TEXT, reply_markup=main_kb(uid))
     except Exception:
         pass
-    base = _admin_msg_base(cq.message)
-    try:
-        await cq.message.edit_text(base + f"\n\n❌ Rad etildi\n👮 Admin: {admin_label(cq.from_user)}")
-    except TelegramBadRequest:
-        pass
-    await notify_admins(bot, f"📝 Shikoyat #{cid} rad etildi.\n"
-                             f"👤 <code>{rec['uid']}</code>\n"
-                             f"👮 Admin: {admin_label(cq.from_user)}",
-                        exclude=cq.from_user.id)
-    await cq.answer("❌ Rad etildi.")
+    await cq.answer(f"❌ #{cid} rad etildi va o'chirildi.")
+    await _show_comp(cq)
 
 
 @router_admin.callback_query(F.data == "comp:clr")
