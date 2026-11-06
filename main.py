@@ -2874,11 +2874,39 @@ async def on_join_request(req: ChatJoinRequest):
 
 # ---- zaxira: yakuniy handlerlar ----
 
+def quick_find_movies(query, limit=20):
+    q = (query or "").strip().lstrip("#").strip().casefold()
+    if not q:
+        return []
+    for code, mv in db.movies.items():
+        if code.casefold() == q:
+            return [mv]
+    exact = [mv for mv in db.movies.values()
+             if (mv.get("name") or "").casefold() == q]
+    if exact:
+        return exact[:limit]
+    return [mv for mv in db.movies.values()
+            if q in (mv.get("name") or "").casefold()][:limit]
+
+
 @router_user.message(F.chat.type == "private")
 async def private_fallback(m: Message, state: FSMContext):
     st = await state.get_state()
     if st:
         return await m.answer("❌ Bu qadamda bunday xabar qabul qilinmaydi.\nBekor qilish: /bekor")
+    text = (m.text or "").strip()
+    if text and not text.startswith("/"):
+        found = quick_find_movies(text)
+        if len(found) == 1:
+            return await send_card(m.bot, m.chat.id, found[0]["code"], m.from_user.id, inc=True)
+        if found:
+            rows = [[InlineKeyboardButton(text=f"{CATS.get(mv['category'], '🎬')} {mv['name']}"[:60],
+                                          callback_data=f"show:{mv['code']}")] for mv in found]
+            rows.append([InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")])
+            return await m.answer(f"🔎 Topildi: {len(found)} ta",
+                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return await m.answer("❌ Hech narsa topilmadi.\n\nKino kodini yoki nomini qayta yozib ko'ring.",
+                              reply_markup=main_kb(m.from_user.id))
     await m.answer("🏠 Bosh menyu", reply_markup=main_kb(m.from_user.id))
 
 
