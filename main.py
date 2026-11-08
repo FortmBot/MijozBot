@@ -1198,6 +1198,7 @@ _CB_PERM_PREFIX = {
     "chdel:": "chan",
     "bn:": "users",
     "stg:": "sett", "ste:": "sett",
+    "texnik:": "texnik",
 }
 
 _STATE_PERM = {
@@ -2867,22 +2868,49 @@ async def a_comp_clr(cq: CallbackQuery):
 
 @router_admin.callback_query(F.data == "a:texnik")
 async def a_texnik(cq: CallbackQuery):
-    db.settings["texnik"] = not bool(db.settings.get("texnik", False))
-    db.save()
-    on = bool(db.settings["texnik"])
+    # Bo'limga kirish holatni o'zgartirmaydi — faqat joriy holatni ko'rsatadi.
+    await _show_texnik(cq)
+    await cq.answer()
+
+
+def _texnik_view():
+    on = bool(db.settings.get("texnik", False))
     holat = "🔴 YOQILGAN" if on else "🟢 O'CHIRILGAN"
     text = ("🛠 <b>Texnik ishlar rejimi</b>\n\n"
             "Holat: " + holat + "\n\n"
             + ("Foydalanuvchilar botga yozganda «texnik ishlar ketmoqda» deb javob oladi. "
                "Adminlar va owner botdan normal foydalanadi."
                if on else
-               "Bot yana barcha foydalanuvchilar uchun ishlaydi."))
+               "Bot hozir barcha foydalanuvchilar uchun ochiq."))
+    if on:
+        action = [InlineKeyboardButton(text="🟢 O'chirish", callback_data="texnik:off")]
+    else:
+        action = [InlineKeyboardButton(text="🔴 Yoqish", callback_data="texnik:on")]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=("🔴 O'chirish" if on else "🟢 Yoqish"),
-                              callback_data="a:texnik")],
+        action,
         [InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")]])
+    return text, kb
+
+
+async def _show_texnik(cq: CallbackQuery):
+    text, kb = _texnik_view()
     await edit_msg(cq, text, kb)
-    await cq.answer("🛠 Texnik ishlar yoqildi." if on else "✅ Texnik ishlar o'chirildi.")
+
+
+@router_admin.callback_query(F.data == "texnik:on")
+async def texnik_on(cq: CallbackQuery):
+    db.settings["texnik"] = True
+    db.save()
+    await _show_texnik(cq)
+    await cq.answer("🛠 Texnik ishlar yoqildi.")
+
+
+@router_admin.callback_query(F.data == "texnik:off")
+async def texnik_off(cq: CallbackQuery):
+    db.settings["texnik"] = False
+    db.save()
+    await _show_texnik(cq)
+    await cq.answer("✅ Texnik ishlar o'chirildi.")
 
 
 # ---- analitika ----
