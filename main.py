@@ -167,6 +167,7 @@ def blank_data():
         "receipts": {},
         "complaints": [],
         "banned": [],
+        "admins": {},
         "orders": [],
         "join_requests": {},
         "groups": {},
@@ -186,6 +187,7 @@ class DB:
         self.receipts = d["receipts"]
         self.complaints = d["complaints"]
         self.banned = d["banned"]
+        self.admins = d["admins"]
         self.orders = d["orders"]
         self.join_requests = d["join_requests"]
         self.groups = d["groups"]
@@ -202,6 +204,7 @@ class DB:
             "receipts": self.receipts,
             "complaints": self.complaints,
             "banned": self.banned,
+            "admins": self.admins,
             "orders": self.orders,
             "join_requests": self.join_requests,
             "groups": self.groups,
@@ -221,6 +224,7 @@ class DB:
         self.receipts = d.get("receipts", {}) or {}
         self.complaints = d.get("complaints", []) or []
         self.banned = d.get("banned", []) or []
+        self.admins = d.get("admins", {}) or {}
         self.orders = d.get("orders", []) or []
         self.join_requests = d.get("join_requests", {}) or {}
         self.groups = d.get("groups", {}) or {}
@@ -307,6 +311,52 @@ def is_vip(uid) -> bool:
         except Exception:
             return False
     return False
+
+
+ADMIN_PERMS = {
+    "stat": "📊 Statistika",
+    "content": "🎬 Kontent boshqaruvi",
+    "bcast": "📢 Xabar yuborish",
+    "orders": "🧾 To'lovlar va buyurtmalar",
+    "comp": "⚠️ Shikoyatlar",
+    "chan": "📣 Kanallar",
+    "texnik": "🛠 Texnik ishlar",
+    "users": "👥 Foydalanuvchilar / Ban",
+    "anal": "📈 Analitika / Import-eksport",
+    "prem": "💎 Premium",
+    "sett": "⚙️ Sozlamalar",
+    "back": "💾 Zaxira",
+}
+
+
+def is_owner(uid) -> bool:
+    try:
+        return int(uid) in ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+def is_admin(uid) -> bool:
+    return is_owner(uid) or str(uid) in db.admins
+
+
+def admin_perms(uid):
+    if is_owner(uid):
+        return set(ADMIN_PERMS) | {"admins"}
+    rec = db.admins.get(str(uid)) or {}
+    return {p for p in rec.get("perms", []) if p in ADMIN_PERMS}
+
+
+def has_perm(uid, perm) -> bool:
+    return perm in admin_perms(uid)
+
+
+def all_admin_ids():
+    ids = set(ADMIN_IDS)
+    for uid in db.admins:
+        if str(uid).lstrip("-").isdigit():
+            ids.add(int(uid))
+    return sorted(ids)
 
 
 def vip_status(uid):
@@ -605,7 +655,7 @@ def main_kb(uid):
         [KeyboardButton(text=BTN_ORDER), KeyboardButton(text=BTN_COMPLAINT)],
         [KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_PREMIUM)],
     ]
-    if uid in ADMIN_IDS:
+    if is_admin(uid):
         rows.append([KeyboardButton(text=BTN_ADMIN)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -630,6 +680,7 @@ def admin_kb():
          InlineKeyboardButton(text="💎 Premium", callback_data="a:prem")],
         [InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="a:sett"),
          InlineKeyboardButton(text="💾 Zaxira", callback_data="a:back")],
+        [InlineKeyboardButton(text="👑 Adminlar", callback_data="a:admins")],
         [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="a:home")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=b)
@@ -757,7 +808,7 @@ def actions_row(uid, code, season=0, page=0):
 def actions_row2(uid, code):
     row = [InlineKeyboardButton(text="⭐ Baholash", callback_data=f"rate:{code}"),
            InlineKeyboardButton(text="⚠️ Xatolik", callback_data=f"report:{code}")]
-    if uid in ADMIN_IDS:
+    if has_perm(uid, "content"):
         row.append(InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del_media:{code}"))
     return row
 
@@ -913,7 +964,7 @@ async def check_subscription(bot, uid):
 
 
 async def notify_admins(bot, text, exclude=None, kb=None):
-    for aid in ADMIN_IDS:
+    for aid in all_admin_ids():
         if exclude is not None and aid == exclude:
             continue
         try:
@@ -941,7 +992,7 @@ async def send_card(bot, chat_id, code, uid, inc=False):
         mv["views"] = int(mv.get("views", 0)) + 1
         db.save()
     caption = card_caption(mv)
-    if mv.get("tariff") == "vip" and not is_vip(uid) and uid not in ADMIN_IDS:
+    if mv.get("tariff") == "vip" and not is_vip(uid) and not is_admin(uid):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="pr")],
             [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")]])
@@ -998,7 +1049,7 @@ class GuardMiddleware(BaseMiddleware):
 
         if user is None:
             return await handler(event, data)
-        if user.id in ADMIN_IDS:
+        if is_admin(user.id):
             return await handler(event, data)
 
         if db.settings.get("texnik"):
@@ -1083,6 +1134,10 @@ class RestoreFlow(StatesGroup):
     file = State()
 
 
+class AdminFlow(StatesGroup):
+    add_id = State()
+
+
 class SearchName(StatesGroup):
     q = State()
 
@@ -1113,7 +1168,88 @@ class ReportFlow(StatesGroup):
 class AdminFilter(Filter):
     async def __call__(self, obj):
         u = getattr(obj, "from_user", None)
-        return u is not None and u.id in ADMIN_IDS
+        return u is not None and is_admin(u.id)
+
+
+_CB_PERM_EXACT = {
+    "a:stat": "stat",
+    "a:content": "content", "a:movies": "content", "a:addm": "content",
+    "a:parts": "content", "a:del": "content",
+    "delm_list": "content", "dels_list": "content", "dele_list": "content",
+    "a:bcast": "bcast",
+    "a:orders": "orders", "a:uorders": "orders",
+    "a:comp": "comp", "comp:clr": "comp",
+    "a:chan": "chan", "chadd": "chan",
+    "a:texnik": "texnik",
+    "a:users": "users", "a:ucsv": "users", "a:ban": "users",
+    "a:anal": "anal", "a:expe": "anal", "a:expi": "anal",
+    "a:prem": "prem", "a:vcsv": "prem",
+    "a:sett": "sett",
+    "a:back": "back", "back:send": "back", "a:restore": "back",
+}
+
+_CB_PERM_PREFIX = {
+    "acat:": "content", "atr:": "content",
+    "del_media:": "content", "del_media_ok:": "content",
+    "delse:": "content", "delsok:": "content",
+    "delee:": "content", "delees:": "content", "deleok:": "content",
+    "apr:": "orders", "rej:": "orders", "ord_ok:": "orders",
+    "cmp_ok:": "comp", "cmp_rej:": "comp",
+    "chdel:": "chan",
+    "bn:": "users",
+    "stg:": "sett", "ste:": "sett",
+}
+
+_STATE_PERM = {
+    "AddContent": "content",
+    "AddEpisodes": "content",
+    "Bcast": "bcast",
+    "ChanAdd": "chan",
+    "BanFlow": "users",
+    "ImpFlow": "anal",
+    "SetFlow": "sett",
+    "RestoreFlow": "back",
+    "AdminFlow": "admins",
+}
+
+
+def _cb_perm(cb):
+    if cb in _CB_PERM_EXACT:
+        return _CB_PERM_EXACT[cb]
+    for pref, perm in _CB_PERM_PREFIX.items():
+        if cb.startswith(pref):
+            return perm
+    return None
+
+
+class AdminPermMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None or not is_admin(user.id):
+            return await handler(event, data)
+        uid = user.id
+        if isinstance(event, CallbackQuery):
+            cb = event.data or ""
+            if cb == "a:admins" or cb.startswith("adm:"):
+                if not is_owner(uid):
+                    return await event.answer("⛔ Faqat owner uchun.", show_alert=True)
+                return await handler(event, data)
+            perm = _cb_perm(cb)
+            if perm and not has_perm(uid, perm):
+                return await event.answer("⛔ Bu bo'lim uchun ruxsatingiz yo'q.", show_alert=True)
+            return await handler(event, data)
+        if isinstance(event, Message):
+            group = (data.get("raw_state") or "").split(":")[0]
+            perm = _STATE_PERM.get(group)
+            if perm == "admins":
+                if not is_owner(uid):
+                    state = data.get("state")
+                    if state is not None:
+                        await state.clear()
+                    return await event.answer("⛔ Faqat owner uchun.")
+            elif perm and not has_perm(uid, perm):
+                return await event.answer("⛔ Bu bo'lim uchun ruxsatingiz yo'q.")
+        return await handler(event, data)
 
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -1146,7 +1282,7 @@ async def menu_intercept(m: Message, state: FSMContext):
     if t == BTN_PREMIUM:
         return await menu_premium(m, state)
     if t == BTN_ADMIN:
-        if m.from_user.id in ADMIN_IDS:
+        if is_admin(m.from_user.id):
             return await admin_panel(m)
         return await m.answer("⛔ Faqat admin uchun.", reply_markup=main_kb(m.from_user.id))
     return await m.answer("🏠 Bosh menyu", reply_markup=main_kb(m.from_user.id))
@@ -1156,6 +1292,8 @@ router_user = Router()
 router_admin = Router()
 router_admin.message.filter(AdminFilter())
 router_admin.callback_query.filter(AdminFilter())
+router_admin.message.outer_middleware(AdminPermMiddleware())
+router_admin.callback_query.outer_middleware(AdminPermMiddleware())
 
 
 @router_user.message(Command("bekor", "cancel"))
@@ -1340,7 +1478,7 @@ async def cb_episode(cq: CallbackQuery, bot: Bot):
     if not mv:
         await cq.answer("❌ Kino topilmadi.", show_alert=True)
         return
-    if mv.get("tariff") == "vip" and not is_vip(cq.from_user.id) and cq.from_user.id not in ADMIN_IDS:
+    if mv.get("tariff") == "vip" and not is_vip(cq.from_user.id) and not is_admin(cq.from_user.id):
         await cq.answer("🔒 Bu kontent faqat VIP uchun!", show_alert=True)
         return
     try:
@@ -1466,7 +1604,7 @@ async def report_send(m: Message, state: FSMContext, bot: Bot):
     code = data.get("report_code", "")
     mv = db.movies.get(code) or {}
     text = m.text.strip()
-    for aid in ADMIN_IDS:
+    for aid in [a for a in all_admin_ids() if has_perm(a, "comp")]:
         try:
             await bot.send_message(
                 aid,
@@ -1719,7 +1857,7 @@ async def pay_receipt(m: Message, state: FSMContext, bot: Bot):
         [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"apr:{rid}"),
          InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rej:{rid}")],
     ])
-    for aid in ADMIN_IDS:
+    for aid in [a for a in all_admin_ids() if has_perm(a, "orders")]:
         try:
             await m.copy_to(aid)
             await bot.send_message(
@@ -2837,6 +2975,179 @@ async def a_vcsv(cq: CallbackQuery):
     await cq.answer()
 
 
+# ---- adminlar (owner) ----
+
+def _admin_perms_text(uid):
+    rec = db.admins.get(str(uid)) or {}
+    perms = [p for p in rec.get("perms", []) if p in ADMIN_PERMS]
+    nm = he(rec.get("name") or str(uid))
+    un = f"@{he(rec['username'])}" if rec.get("username") else "—"
+    return ("🛡 <b>Admin huquqlari</b>\n\n"
+            f"👤 {nm}\n🔗 {un}\n🆔 <code>{uid}</code>\n\n"
+            f"✅ Berilgan huquqlar: {len(perms)}/{len(ADMIN_PERMS)}\n"
+            "Tugmalar bilan huquqlarni yoqing yoki o'chiring:")
+
+
+def _admin_perms_kb(uid):
+    rec = db.admins.get(str(uid)) or {}
+    perms = set(rec.get("perms", []))
+    rows = []
+    for key, label in ADMIN_PERMS.items():
+        mark = "✅" if key in perms else "❌"
+        rows.append([InlineKeyboardButton(text=f"{mark} {label}",
+                                          callback_data=f"adm:perm:{uid}:{key}")])
+    rows.append([InlineKeyboardButton(text="✅ Barchasi", callback_data=f"adm:all:{uid}"),
+                 InlineKeyboardButton(text="❌ Hech biri", callback_data=f"adm:none:{uid}")])
+    rows.append([InlineKeyboardButton(text="🗑 Adminni o'chirish", callback_data=f"adm:del:{uid}")])
+    rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:admins")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_admins(cq):
+    lines = ["👑 <b>Adminlar boshqaruvi</b>\n", "👑 <b>Ownerlar (to'liq huquq)</b>"]
+    for oid in ADMIN_IDS:
+        lines.append(f"• <code>{oid}</code>")
+    lines.append(f"\n🛡 <b>Adminlar: {len(db.admins)} ta</b>")
+    rows = [[InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="adm:add")]]
+    for uid, rec in db.admins.items():
+        perms = [p for p in rec.get("perms", []) if p in ADMIN_PERMS]
+        nm = rec.get("name") or uid
+        lines.append(f"• {he(str(nm))} (<code>{uid}</code>) — {len(perms)} huquq")
+        rows.append([InlineKeyboardButton(text=f"👤 {nm}"[:40], callback_data=f"adm:view:{uid}")])
+    if not db.admins:
+        lines.append("Hozircha adminlar yo'q.")
+    rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
+    await edit_msg(cq, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router_admin.callback_query(F.data == "a:admins")
+async def a_admins(cq: CallbackQuery):
+    if not is_owner(cq.from_user.id):
+        return await cq.answer("⛔ Faqat owner uchun.", show_alert=True)
+    await _show_admins(cq)
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data == "adm:add")
+async def adm_add(cq: CallbackQuery, state: FSMContext):
+    if not is_owner(cq.from_user.id):
+        return await cq.answer("⛔ Faqat owner uchun.", show_alert=True)
+    await state.set_state(AdminFlow.add_id)
+    await edit_msg(cq, "➕ <b>Admin qo'shish</b>\n\n"
+                       "Yangi adminning Telegram ID sini yuboring (faqat raqam).\n"
+                       "Masalan: <code>123456789</code>\n\n"
+                       "Bekor qilish: /bekor")
+    await cq.answer()
+
+
+@router_admin.message(AdminFlow.add_id, F.text)
+async def adm_add_id(m: Message, state: FSMContext, bot: Bot):
+    if not is_owner(m.from_user.id):
+        await state.clear()
+        return await m.answer("⛔ Faqat owner uchun.")
+    raw = (m.text or "").strip()
+    if raw in ("/bekor", "/cancel"):
+        await state.clear()
+        return await m.answer("❌ Bekor qilindi.", reply_markup=admin_kb())
+    if not (raw.isascii() and raw.isdigit()) or int(raw) <= 0:
+        return await m.answer("❌ ID faqat musbat raqam bo'lishi kerak. Masalan: 123456789")
+    uid = int(raw)
+    if uid in ADMIN_IDS:
+        await state.clear()
+        return await m.answer("ℹ️ Bu foydalanuvchi allaqachon owner (to'liq huquq).",
+                              reply_markup=admin_kb())
+    suid = str(uid)
+    if suid in db.admins:
+        await state.clear()
+        return await m.answer("ℹ️ Bu foydalanuvchi allaqachon admin.", reply_markup=admin_kb())
+    name, username = "", ""
+    try:
+        chat = await bot.get_chat(uid)
+        name = getattr(chat, "full_name", "") or getattr(chat, "title", "") or ""
+        username = getattr(chat, "username", "") or ""
+    except Exception:
+        pass
+    db.admins[suid] = {"perms": [], "name": name, "username": username,
+                       "added_by": m.from_user.id, "added_at": now_iso()}
+    db.save()
+    await state.clear()
+    await m.answer(f"✅ Admin qo'shildi: <code>{uid}</code>\nEndi huquqlarni belgilang.",
+                   reply_markup=admin_kb())
+    await m.answer(_admin_perms_text(suid), reply_markup=_admin_perms_kb(suid))
+
+
+@router_admin.callback_query(F.data.startswith("adm:view:"))
+async def adm_view(cq: CallbackQuery):
+    if not is_owner(cq.from_user.id):
+        return await cq.answer("⛔ Faqat owner uchun.", show_alert=True)
+    uid = cq.data.split(":")[2]
+    if uid not in db.admins:
+        return await cq.answer("Admin topilmadi.", show_alert=True)
+    await edit_msg(cq, _admin_perms_text(uid), _admin_perms_kb(uid))
+    await cq.answer()
+
+
+@router_admin.callback_query(F.data.startswith("adm:perm:"))
+async def adm_perm(cq: CallbackQuery):
+    if not is_owner(cq.from_user.id):
+        return await cq.answer("⛔ Faqat owner uchun.", show_alert=True)
+    parts = cq.data.split(":")
+    if len(parts) != 4:
+        return await cq.answer("❌ Xato tugma.")
+    _, _, uid, perm = parts
+    rec = db.admins.get(uid)
+    if rec is None or perm not in ADMIN_PERMS:
+        return await cq.answer("Topilmadi.", show_alert=True)
+    perms = rec.setdefault("perms", [])
+    if perm in perms:
+        perms.remove(perm)
+    else:
+        perms.append(perm)
+    db.save()
+    await edit_msg(cq, _admin_perms_text(uid), _admin_perms_kb(uid))
+    await cq.answer("✅ O'zgartirildi")
+
+
+@router_admin.callback_query(F.data.startswith("adm:all:"))
+async def adm_all(cq: CallbackQuery):
+    if not is_owner(cq.from_user.id):
+        return await cq.answer("⛔ Faqat owner uchun.", show_alert=True)
+    uid = cq.data.split(":")[2]
+    rec = db.admins.get(uid)
+    if rec is None:
+        return await cq.answer("Admin topilmadi.", show_alert=True)
+    rec["perms"] = list(ADMIN_PERMS)
+    db.save()
+    await edit_msg(cq, _admin_perms_text(uid), _admin_perms_kb(uid))
+    await cq.answer("✅ Barcha huquqlar berildi")
+
+
+@router_admin.callback_query(F.data.startswith("adm:none:"))
+async def adm_none(cq: CallbackQuery):
+    if not is_owner(cq.from_user.id):
+        return await cq.answer("⛔ Faqat owner uchun.", show_alert=True)
+    uid = cq.data.split(":")[2]
+    rec = db.admins.get(uid)
+    if rec is None:
+        return await cq.answer("Admin topilmadi.", show_alert=True)
+    rec["perms"] = []
+    db.save()
+    await edit_msg(cq, _admin_perms_text(uid), _admin_perms_kb(uid))
+    await cq.answer("❌ Huquqlar olib tashlandi")
+
+
+@router_admin.callback_query(F.data.startswith("adm:del:"))
+async def adm_del(cq: CallbackQuery):
+    if not is_owner(cq.from_user.id):
+        return await cq.answer("⛔ Faqat owner uchun.", show_alert=True)
+    uid = cq.data.split(":")[2]
+    if uid in db.admins:
+        del db.admins[uid]
+        db.save()
+    await cq.answer("🗑 Admin o'chirildi.")
+    await _show_admins(cq)
+
+
 # ---- sozlamalar ----
 
 @router_admin.callback_query(F.data == "a:sett")
@@ -3089,7 +3400,7 @@ async def a_restore_text(m: Message):
 
 @dp.message(Command("xabar"), F.chat.type.in_({"group", "supergroup"}))
 async def group_xabar(m: Message):
-    if m.from_user is None or m.from_user.id not in ADMIN_IDS:
+    if m.from_user is None or not is_admin(m.from_user.id):
         return await m.answer("⛔ Faqat admin uchun.")
     rec = db.groups.setdefault(str(m.chat.id), {"title": m.chat.title or "", "enabled": False})
     rec["enabled"] = not bool(rec.get("enabled"))
