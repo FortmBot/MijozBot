@@ -121,6 +121,7 @@ BTN_CONTINUE = "▶️ Davom ettirish"
 BTN_SEARCH = "🔎 Qidiruv"
 BTN_FAVS = "❤️ Sevimlilarim"
 BTN_ACCOUNT = "👤 Hisobim"
+BTN_MUNDARIJA = "📖 Mundarija"
 BTN_ORDER = "🛒 Buyurtma qilish"
 BTN_COMPLAINT = "📝 Shikoyat"
 BTN_CONTACT = "📞 Admin bilan bog'lanish"
@@ -128,7 +129,7 @@ BTN_PREMIUM = "💎 Premium"
 BTN_ADMIN = "👑 Admin panel"
 
 MENU_TEXTS = {
-    BTN_CONTINUE, BTN_SEARCH, BTN_FAVS, BTN_ACCOUNT,
+    BTN_CONTINUE, BTN_SEARCH, BTN_FAVS, BTN_ACCOUNT, BTN_MUNDARIJA,
     BTN_ORDER, BTN_COMPLAINT, BTN_CONTACT, BTN_PREMIUM, BTN_ADMIN,
 }
 
@@ -547,6 +548,15 @@ def channel_aliases(cid):
     return list(dict.fromkeys(out))
 
 
+def is_instagram_channel(cid, link=""):
+    return str(cid).startswith("ig:") or "instagram.com" in str(link)
+
+
+def instagram_name(cid):
+    cid = str(cid)
+    return cid[3:] if cid.startswith("ig:") else cid
+
+
 def seasons_of(mv):
     ss = set()
     for k in (mv.get("parts", {}) or {}):
@@ -591,6 +601,7 @@ def main_kb(uid):
     rows = [
         [KeyboardButton(text=BTN_CONTINUE), KeyboardButton(text=BTN_SEARCH)],
         [KeyboardButton(text=BTN_FAVS), KeyboardButton(text=BTN_ACCOUNT)],
+        [KeyboardButton(text=BTN_MUNDARIJA)],
         [KeyboardButton(text=BTN_ORDER), KeyboardButton(text=BTN_COMPLAINT)],
         [KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_PREMIUM)],
     ]
@@ -624,11 +635,17 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=b)
 
 
-def sub_kb():
+def sub_kb(uid=None):
     rows = []
-    for entry in db.channels:
+    ig_ok = (db.users.get(str(uid), {}).get("ig_ok") or []) if uid is not None else []
+    for i, entry in enumerate(db.channels):
         cid, link = parse_channel_entry(entry)
-        rows.append([InlineKeyboardButton(text=f"📢 {cid}", url=link)])
+        if is_instagram_channel(cid, link):
+            mark = "✅" if cid in ig_ok else "📸"
+            rows.append([InlineKeyboardButton(text=f"{mark} Instagram: {instagram_name(cid)}",
+                                              callback_data=f"igopen:{i}")])
+        else:
+            rows.append([InlineKeyboardButton(text=f"📢 {cid}", url=link)])
     rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="checksub")])
     rows.append([InlineKeyboardButton(text="💎 VIP olish (obunasiz)", callback_data="pr")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -789,14 +806,67 @@ def card_kb(uid, code):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def movie_label(mv, with_cat=False):
+    """Kino tugmasi matni: nom yonida kodi ham ko'rinadi."""
+    prefix = f"{CATS.get(mv.get('category'), '🎬')} " if with_cat else ""
+    suffix = f" ({mv.get('code', '')})"
+    name = str(mv.get("name", ""))
+    room = max(1, 60 - len(prefix) - len(suffix))
+    return f"{prefix}{name[:room]}{suffix}"
+
+
+def mundarija_text():
+    return ("📖 <b>Mundarija</b>\n\n"
+            "Kinolar ikki tarifga bo'lingan:\n"
+            "🆓 <b>Oddiy tarif</b> — bepul kinolar\n"
+            "💎 <b>VIP tarif</b> — faqat VIP foydalanuvchilar uchun\n\n"
+            "Har bir kino yonida uning <b>kodi</b> ko'rsatilgan.")
+
+
+def mundarija_menu_kb():
+    oddiy = sum(1 for mv in db.movies.values() if mv.get("tariff") != "vip")
+    vip = sum(1 for mv in db.movies.values() if mv.get("tariff") == "vip")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🆓 Oddiy tarif ({oddiy})", callback_data="mdr:oddiy:0")],
+        [InlineKeyboardButton(text=f"💎 VIP tarif ({vip})", callback_data="mdr:vip:0")],
+        [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")],
+    ])
+
+
+def mundarija_list_kb(tariff, page=0, per=LIST_PER_PAGE):
+    items = [mv for mv in db.movies.values()
+             if ("vip" if mv.get("tariff") == "vip" else "oddiy") == tariff]
+    total = len(items)
+    pages = max(1, (total + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * per:(page + 1) * per]
+    rows = [[InlineKeyboardButton(text=movie_label(mv, with_cat=True),
+                                  callback_data=f"show:{mv['code']}")] for mv in chunk]
+    if not chunk:
+        rows.append([InlineKeyboardButton(text="Hozircha kino yo'q", callback_data="noop")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"mdr:{tariff}:{page - 1}"))
+    if pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mdr:{tariff}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if tariff == "vip":
+        rows.append([InlineKeyboardButton(text="💎 VIP olish", callback_data="pr")])
+    rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="mundarija")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def movies_list_kb(page=0, per=LIST_PER_PAGE):
     items = list(db.movies.values())
     total = len(items)
     chunk = items[page * per:(page + 1) * per]
     rows = []
     for mv in chunk:
-        label = f"{CATS.get(mv['category'], '🎬')} {mv['name']}"[:60]
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"show:{mv['code']}")])
+        rows.append([InlineKeyboardButton(text=movie_label(mv, with_cat=True),
+                                          callback_data=f"show:{mv['code']}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"ml:{page - 1}"))
@@ -816,8 +886,14 @@ async def check_subscription(bot, uid):
         return True, []
     requested = {str(x) for x in db.join_requests.get(str(uid), [])}
     bad = []
+    ig_ok = db.users.get(str(uid), {}).get("ig_ok") or []
     for entry in db.channels:
-        cid, _ = parse_channel_entry(entry)
+        cid, link = parse_channel_entry(entry)
+        if is_instagram_channel(cid, link):
+            # Instagram API orqali tekshirilmaydi: foydalanuvchi tugmani bosgani hisobga olinadi.
+            if cid not in ig_ok:
+                bad.append(cid)
+            continue
         aliases = channel_aliases(cid)
         if requested & set(aliases):
             continue
@@ -944,7 +1020,7 @@ class GuardMiddleware(BaseMiddleware):
 
         need_check = False
         if isinstance(event, CallbackQuery):
-            need_check = event.data != "checksub"
+            need_check = event.data != "checksub" and not event.data.startswith("igopen:")
         elif isinstance(event, Message):
             txt = (event.text or "").strip().lower()
             need_check = not (txt.startswith("/start") or txt.startswith("/bekor") or txt.startswith("/cancel"))
@@ -957,11 +1033,11 @@ class GuardMiddleware(BaseMiddleware):
                 if isinstance(event, CallbackQuery):
                     await event.answer("⚠️ Avval kanallarga obuna bo'ling!", show_alert=True)
                     try:
-                        await bot_.send_message(user.id, SUB_TEXT, reply_markup=sub_kb())
+                        await bot_.send_message(user.id, SUB_TEXT, reply_markup=sub_kb(user.id))
                     except Exception:
                         pass
                 else:
-                    await event.answer(SUB_TEXT, reply_markup=sub_kb())
+                    await event.answer(SUB_TEXT, reply_markup=sub_kb(user.id))
                 return
         return await handler(event, data)
 
@@ -1059,6 +1135,8 @@ async def menu_intercept(m: Message, state: FSMContext):
         return await menu_favorites(m, state)
     if t == BTN_ACCOUNT:
         return await menu_account(m, state)
+    if t == BTN_MUNDARIJA:
+        return await menu_mundarija(m, state)
     if t == BTN_ORDER:
         return await menu_order(m, state)
     if t == BTN_COMPLAINT:
@@ -1157,6 +1235,11 @@ async def menu_account(m: Message, state: FSMContext):
          InlineKeyboardButton(text="🛒 Buyurtma qilish", callback_data="order_new")],
         [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")]])
     await m.answer(text, reply_markup=kb)
+
+
+async def menu_mundarija(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer(mundarija_text(), reply_markup=mundarija_menu_kb())
 
 
 async def menu_order(m: Message, state: FSMContext):
@@ -1429,7 +1512,7 @@ def category_kb(cat, page):
     pages = max(1, (len(items) + per - 1) // per)
     page = max(0, min(page, pages - 1))
     chunk = items[page * per:(page + 1) * per]
-    rows = [[InlineKeyboardButton(text=f"{mv['name']}"[:60], callback_data=f"show:{mv['code']}")]
+    rows = [[InlineKeyboardButton(text=movie_label(mv), callback_data=f"show:{mv['code']}")]
             for mv in chunk]
     if not chunk:
         rows.append([InlineKeyboardButton(text="Bo'sh", callback_data="noop")])
@@ -1483,6 +1566,33 @@ async def cb_list(cq: CallbackQuery):
 async def cb_ml(cq: CallbackQuery):
     page = int(cq.data.split(":")[1])
     await edit_msg(cq, "🎬 <b>Barcha kinolar:</b>", movies_list_kb(page))
+    await cq.answer()
+
+
+@router_user.callback_query(F.data == "mundarija")
+async def cb_mundarija(cq: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await edit_msg(cq, mundarija_text(), mundarija_menu_kb())
+    await cq.answer()
+
+
+@router_user.callback_query(F.data.startswith("mdr:"))
+async def cb_mundarija_list(cq: CallbackQuery):
+    try:
+        _, tariff, page = cq.data.split(":")
+        page = int(page)
+    except ValueError:
+        await cq.answer("❌ Xato tugma.")
+        return
+    if tariff not in ("oddiy", "vip"):
+        tariff = "oddiy"
+    if tariff == "vip":
+        title = ("💎 <b>VIP tarif kinolari</b>\n\n"
+                 "🔒 Bu kinolar faqat VIP foydalanuvchilar uchun. "
+                 "VIP oling va hammasini bemalol ko'ring!")
+    else:
+        title = "🆓 <b>Oddiy tarif kinolari</b>\n\nBepul kinolar — bemalol tomosha qiling."
+    await edit_msg(cq, title, mundarija_list_kb(tariff, page))
     await cq.answer()
 
 
@@ -1681,6 +1791,36 @@ async def order_year(m: Message, state: FSMContext, bot: Bot):
 
 
 # ---- obuna ----
+
+@router_user.callback_query(F.data.startswith("igopen:"))
+async def cb_igopen(cq: CallbackQuery):
+    try:
+        i = int(cq.data.split(":")[1])
+    except ValueError:
+        await cq.answer("❌ Xato tugma.")
+        return
+    if not (0 <= i < len(db.channels)):
+        await cq.answer("Kanal topilmadi.", show_alert=True)
+        return
+    cid, link = parse_channel_entry(db.channels[i])
+    if not is_instagram_channel(cid, link):
+        await cq.answer()
+        return
+    u = db.user(cq.from_user.id)
+    oks = u.setdefault("ig_ok", [])
+    if cid not in oks:
+        oks.append(cid)
+        db.save()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📸 Instagramga o'tish", url=link)],
+        [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="checksub")],
+    ])
+    await cq.message.answer(
+        f"📸 <b>Instagram: @{he(instagram_name(cid))}</b>\n\n"
+        "Sahifamizga obuna bo'ling va «✅ Obunani tekshirish» tugmasini bosing.",
+        reply_markup=kb)
+    await cq.answer("✅ Qabul qilindi.")
+
 
 @router_user.callback_query(F.data == "checksub")
 async def check_sub(cq: CallbackQuery, bot: Bot):
@@ -2182,7 +2322,11 @@ def channels_kb():
     rows = []
     for i, ch in enumerate(db.channels):
         cid, link = parse_channel_entry(ch)
-        rows.append([InlineKeyboardButton(text=f"❌ {cid}"[:60], callback_data=f"chdel:{i}")])
+        if is_instagram_channel(cid, link):
+            label = f"❌ 📸 {instagram_name(cid)}"
+        else:
+            label = f"❌ {cid}"
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"chdel:{i}")])
     rows.append([InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="chadd")])
     rows.append([InlineKeyboardButton(text="« Orqaga", callback_data="a:panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2192,14 +2336,19 @@ def channels_text():
     lines = []
     for ch in db.channels:
         cid, link = parse_channel_entry(ch)
-        lines.append(f"• <code>{he(cid)}</code> → {he(link)}")
+        if is_instagram_channel(cid, link):
+            lines.append(f"• 📸 @{he(instagram_name(cid))} → {he(link)}")
+        else:
+            lines.append(f"• <code>{he(cid)}</code> → {he(link)}")
     body = "\n".join(lines) if lines else "Hozircha kanal qo'shilmagan."
     return (f"📣 <b>Majburiy obuna kanallari</b>\n\n{body}\n\n"
             "Qo'shish formatlari:\n"
             "• <code>@kanal_username</code>\n"
             "• <code>-1001234567890</code>\n"
-            "• <code>-1001234567890|https://t.me/+taklif_havolasi</code> (yopiq kanal)\n\n"
-            "Yopiq kanalda bot admin bo'lsa, qo'shilish so'rovlari ham obuna deb hisoblanadi.")
+            "• <code>-1001234567890|https://t.me/+taklif_havolasi</code> (yopiq kanal)\n"
+            "• <code>instagram:@sahifa</code> yoki <code>https://instagram.com/sahifa</code>\n\n"
+            "Yopiq kanalda bot admin bo'lsa, qo'shilish so'rovlari ham obuna deb hisoblanadi.\n"
+            "ℹ️ Instagram obunasi API orqali tekshirilmaydi — foydalanuvchi tugmani bosgani hisobga olinadi.")
 
 
 @router_admin.callback_query(F.data == "a:chan")
@@ -2211,20 +2360,44 @@ async def a_chan(cq: CallbackQuery):
 @router_admin.callback_query(F.data == "chadd")
 async def a_chan_add(cq: CallbackQuery, state: FSMContext):
     await state.set_state(ChanAdd.text)
-    await edit_msg(cq, "Kanal yuboring:\n"
+    await edit_msg(cq, "Kanal yoki Instagram yuboring:\n"
                        "• <code>@kanal_username</code>\n"
                        "• <code>-1001234567890</code>\n"
-                       "• <code>-1001234567890|https://t.me/+havola</code>")
+                       "• <code>-1001234567890|https://t.me/+havola</code>\n"
+                       "• <code>instagram:@sahifa</code> yoki <code>https://instagram.com/sahifa</code>")
     await cq.answer()
 
 
 @router_admin.message(ChanAdd.text, F.text)
 async def a_chan_save(m: Message, state: FSMContext):
     raw = m.text.strip()
+    ig_user = None
+    if raw.lower().startswith(("instagram:", "ig:")):
+        ig_user = raw.split(":", 1)[1].strip().lstrip("@")
+    elif "instagram.com/" in raw.lower():
+        mm = re.search(r"instagram\.com/([A-Za-z0-9_.]+)", raw, re.I)
+        if mm:
+            ig_user = mm.group(1)
+    if ig_user is not None:
+        ig_user = ig_user.strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_.]{1,30}", ig_user):
+            await m.answer("❌ Instagram username noto'g'ri. Masalan: instagram:@mening_sahifam")
+            return
+        cid = f"ig:{ig_user}"
+        if any(parse_channel_entry(x)[0] == cid for x in db.channels):
+            await m.answer("❌ Bu Instagram allaqachon qo'shilgan.")
+            return
+        db.channels.append(f"{cid}|https://www.instagram.com/{ig_user}/")
+        db.save()
+        await state.clear()
+        await m.answer(f"✅ Instagram @{ig_user} qo'shildi.\n"
+                       "ℹ️ Foydalanuvchi Instagram tugmasini bosganda obuna hisoblanadi.",
+                       reply_markup=admin_kb())
+        return
     cid = raw.split("|", 1)[0].strip()
     valid = cid.startswith("@") or cid.lstrip("-").isdigit()
     if not valid:
-        await m.answer("❌ Noto'g'ri format. Masalan: @kanal yoki -1001234567890")
+        await m.answer("❌ Noto'g'ri format. Masalan: @kanal, -1001234567890 yoki instagram:@sahifa")
         return
     if any(parse_channel_entry(x)[0] == cid for x in db.channels):
         await m.answer("❌ Bu kanal allaqachon qo'shilgan.")
@@ -3023,4 +3196,3 @@ if __name__ == "__main__":
         tb = traceback.format_exc()
         print(f"Bot xato bilan to'xtadi:\n{tb}", flush=True)
         sys.exit(1)
-
