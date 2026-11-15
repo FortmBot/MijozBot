@@ -908,11 +908,15 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=b)
 
 
-def sub_kb(uid=None):
+def sub_kb(uid=None, missing=None):
+    """Obuna paneli. `missing` berilsa — faqat hozir a'zo bo'lmagan kanallar chiqadi."""
     rows = []
     ig_ok = (db.users.get(str(uid), {}).get("ig_ok") or []) if uid is not None else []
+    only = {str(x) for x in missing} if missing is not None else None
     for i, entry in enumerate(db.channels):
         cid, link = parse_channel_entry(entry)
+        if only is not None and str(cid) not in only:
+            continue
         if is_instagram_channel(cid, link):
             mark = "✅" if cid in ig_ok else "📸"
             rows.append([InlineKeyboardButton(text=f"{mark} Instagram: {instagram_name(cid)}",
@@ -1312,11 +1316,12 @@ class GuardMiddleware(BaseMiddleware):
                 if isinstance(event, CallbackQuery):
                     await event.answer("⚠️ Avval kanallarga obuna bo'ling!", show_alert=True)
                     try:
-                        await bot_.send_message(user.id, SUB_TEXT, reply_markup=sub_kb(user.id))
+                        await bot_.send_message(user.id, SUB_TEXT,
+                                                reply_markup=sub_kb(user.id, _bad))
                     except Exception:
                         pass
                 else:
-                    await event.answer(SUB_TEXT, reply_markup=sub_kb(user.id))
+                    await event.answer(SUB_TEXT, reply_markup=sub_kb(user.id, _bad))
                 return
             u_ref = db.users.get(str(user.id), {}) or {}
             if u_ref.get("referrer") and not u_ref.get("referral_qualified"):
