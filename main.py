@@ -527,6 +527,12 @@ def ref_promo_text():
             f"<b>{referral_vip_days()} kunlik VIP tarif</b> bepul!")
 
 
+def ref_short_text():
+    """Kino posti tavsifi ostidagi qisqa referal satri."""
+    return (f"\n\n🎁 /ref — {referral_need()} ta do'st taklif qilsangiz "
+            f"{referral_vip_days()} kunlik VIP bepul.")
+
+
 def parse_ref_payload(payload):
     p = (payload or "").strip()
     if p.startswith(REF_PREFIX):
@@ -1016,9 +1022,10 @@ def card_caption(mv):
     tariff = "💎 VIP kontent" if mv.get("tariff") == "vip" else "🆓 Bepul"
     year = f"📅 {he(str(mv['year']))}\n" if mv.get("year") else ""
     desc = he(mv.get("desc") or "")
-    return (f"{CATS.get(mv.get('category'), '🎬')} <b>{he(str(mv.get('name', '')))}</b>\n"
+    body = (f"{CATS.get(mv.get('category'), '🎬')} <b>{he(str(mv.get('name', '')))}</b>\n"
             f"⭐ {avg} ({cnt})   👁 {mv.get('views', 0)}   📁 {len(mv.get('parts', {}))}\n"
             f"{tariff}\n{year}\n{desc}").strip()
+    return body + ref_short_text()
 
 
 def actions_row(uid, code, season=0, page=0):
@@ -1226,8 +1233,7 @@ async def send_card(bot, chat_id, code, uid, inc=False):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="pr")],
             [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")]])
-        txt = (caption + "\n\n🔒 Bu kontent faqat VIP foydalanuvchilar uchun!"
-               + ref_promo_text())
+        txt = caption + "\n\n🔒 Bu kontent faqat VIP foydalanuvchilar uchun!"
         if mv.get("photo"):
             await bot.send_photo(chat_id, mv["photo"], caption=txt, reply_markup=kb)
         else:
