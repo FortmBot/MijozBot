@@ -519,6 +519,14 @@ def referral_vip_days():
         return 3
 
 
+def ref_promo_text():
+    """Premium / Mundarija / VIP kino xabarlari ostidagi referal eslatmasi."""
+    return ("\n\n🎁 <b>Yoki VIPni bepul oling!</b>\n"
+            f"🔗 /ref — referal havolangizni do'stlaringizga yuboring.\n"
+            f"👥 {referral_need()} ta do'st botga kirsangiz — "
+            f"<b>{referral_vip_days()} kunlik VIP tarif</b> bepul!")
+
+
 def parse_ref_payload(payload):
     p = (payload or "").strip()
     if p.startswith(REF_PREFIX):
@@ -937,6 +945,7 @@ def premium_text():
          f"To'lov qiling va chekni (rasm/fayl) shu yerga yuboring. "
          f"Admin tasdiqlagach VIP ochiladi.\n"
          f"💡 VIP foydalanuvchilar majburiy obunasiz ham foydalanadi.")
+    t += ref_promo_text()
     if not s["buyurtmalar"]:
         t += "\n\n<i>⚠️ Hozircha buyurtmalar o'chirilgan.</i>"
     return t
@@ -1213,7 +1222,8 @@ async def send_card(bot, chat_id, code, uid, inc=False):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="pr")],
             [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")]])
-        txt = caption + "\n\n🔒 Bu kontent faqat VIP foydalanuvchilar uchun!"
+        txt = (caption + "\n\n🔒 Bu kontent faqat VIP foydalanuvchilar uchun!"
+               + ref_promo_text())
         if mv.get("photo"):
             await bot.send_photo(chat_id, mv["photo"], caption=txt, reply_markup=kb)
         else:
@@ -1987,7 +1997,8 @@ async def cb_mundarija_list(cq: CallbackQuery):
     if tariff == "vip":
         title = ("💎 <b>VIP tarif kinolari</b>\n\n"
                  "🔒 Bu kinolar faqat VIP foydalanuvchilar uchun. "
-                 "VIP oling va hammasini bemalol ko'ring!")
+                 "VIP oling va hammasini bemalol ko'ring!"
+                 + ref_promo_text())
     else:
         title = "🆓 <b>Oddiy tarif kinolari</b>\n\nBepul kinolar — bemalol tomosha qiling."
     await edit_msg(cq, title, mundarija_list_kb(tariff, page))
